@@ -1,0 +1,36 @@
+[project]
+name = "glassbox"
+version = "1.0.0"
+description = "Animated pictures of LLM inference, drawn from real runs of small public models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Paul Wu" }]
+dependencies = []
+
+[project.optional-dependencies]
+trace = ["torch>=2.6", "transformers>=5.0"]
+
+[project.scripts]
+glassbox = "glassbox.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff==0.17.1"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF", "PERF", "PL", "ANN"]
+ignore = ["PLR0913", "PLR0914", "PLR0915", "PLR0917", "PLR2004", "PLC0415", "RUF001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

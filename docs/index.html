@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>glassbox</title>
+<meta name="description" content="Live, interactive figures of LLM inference: speculative decoding on your own GPU, mixture-of-experts routing and GPU waves.">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="glassbox">
+<meta property="og:description" content="Speculative decoding, mixture-of-experts routing and GPU waves, drawn from real runs of small public models.">
+<meta property="og:image" content="https://somethingobvious.github.io/glassbox/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23fdfdfb'/%3E%3Crect x='5' y='9' width='10' height='14' fill='none' stroke='%23121212' stroke-width='2.5'/%3E%3Crect x='17' y='9' width='10' height='14' fill='none' stroke='%23c4161c' stroke-width='2.5' stroke-dasharray='3 2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,700;1,400&family=Libre+Caslon+Text:ital,wght@0,400;0,700;1,400&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#figure-1">Skip to Figure 1</a>
+<header class="running">
+  <b>glassbox</b>
+  <nav aria-label="Figures"><a href="#figure-1">Figure 1</a><a href="#figure-2">Figure 2</a><a href="#figure-3">Figure 3</a></nav>
+  <span><time id="issued" datetime="2026-11">November 2026</time></span>
+</header>
+
+<main>
+<div class="opening" id="draft">
+  <div class="front">
+    <h1>Inside LLM Inference, Drawn From Real Runs of Small Public Models</h1>
+    <p class="author">Paul Wu, <a href="https://github.com/SomethingObvious">github.com/SomethingObvious</a></p>
+    <h2 class="abstract-head">Abstract</h2>
+    <p class="abstract">A small model guesses the next four tokens and a big model checks all four in one forward pass. Guesses up to the first miss are kept, and the big model adds one token of its own. With greedy decoding the text is exactly what the big model writes alone. In the recorded run in Figure 1 that takes 16 big-model passes instead of 48. Figure 2 shows real router choices inside a mixture-of-experts model, and Figure 3 shows why a matrix multiply leaves part of a GPU idle.</p>
+    <div class="action">
+      <button id="d-run" class="go">Run Figure 1 on This GPU</button>
+      <span class="cost">Downloads 1.6 GB once, then your browser caches it</span>
+    </div>
+  </div>
+
+  <figure id="figure-1" class="fig">
+    <div class="sheet">
+      <div class="models" aria-hidden="true">
+        <span><b>Qwen3-0.6B</b> guesses</span>
+        <span><b>Qwen3-1.7B</b> checks in one pass</span>
+      </div>
+      <div class="out" id="d-out" aria-live="polite" aria-label="Generated text, coloured by what happened to each token"></div>
+      <ol class="callouts">
+        <li><i class="k guess"></i><b>102</b> guessed by the small model</li>
+        <li><i class="k kept"></i><b>104</b> kept by the big model</li>
+        <li><i class="k miss"></i><b>106</b> first miss, thrown away</li>
+        <li><i class="k own"></i><b>108</b> the big model's own token</li>
+      </ol>
+    </div>
+    <figcaption><b>Figure 1.</b> Speculative decoding. <span id="d-status">Qwen3-1.7B checking Qwen3-0.6B, four guesses a pass.</span></figcaption>
+    <div class="bar" aria-hidden="true"><i id="d-bar"></i></div>
+    <dl class="readout">
+      <div><dt>tokens written</dt><dd id="s-tok">0</dd></div>
+      <div><dt>big-model passes</dt><dd id="s-pass">0</dd></div>
+      <div><dt>tokens per pass</dt><dd id="s-per">0.00</dd></div>
+      <div><dt>tokens a second</dt><dd id="s-rate">0</dd></div>
+      <div class="hist-cell"><dt>how often guess n is kept</dt><dd class="hist" id="s-hist"></dd></div>
+    </dl>
+    <details class="controls">
+      <summary>Change the Prompt or the Guesses</summary>
+      <div class="row">
+        <label class="f grow">Prompt<textarea id="d-prompt">In three sentences, explain why the sky is blue.</textarea></label>
+      </div>
+      <div class="row">
+        <label class="f" for="d-depth"><span>Guesses per pass <output id="d-depth-v">4</output></span><input id="d-depth" type="range" min="1" max="8" value="4"></label>
+        <label class="f">New tokens<input id="d-max" type="number" min="16" max="256" value="96"></label>
+        <button id="d-replay">Replay the Recorded Run</button>
+        <button id="d-check" disabled>Check Against the Big Model Alone</button>
+      </div>
+    </details>
+  </figure>
+</div>
+
+<section class="part" id="route" aria-labelledby="route-head">
+  <div class="text">
+    <h2 id="route-head">Mixture-of-Experts Routing</h2>
+    <p>IBM Granite 3.0 1B-A400M has 32 experts in each of its 24 layers, and a small router sends every token to 8 of them. Figure 2 shows the router's real decisions from one forward pass over each sentence. Pick a sentence, then hover or tap its tokens.</p>
+    <p class="side-note" id="r-woke"></p>
+  </div>
+  <figure id="figure-2" class="fig">
+    <div class="chips" id="r-runs" role="group" aria-label="Sentence"></div>
+    <div class="toks" id="r-toks"></div>
+    <div class="split">
+      <svg class="grid" id="r-grid" role="img" aria-label="Router choices, layers down and experts across"></svg>
+      <div class="side">
+        <p class="cur"><span class="big" id="r-cur"></span></p>
+        <p id="r-share"></p>
+        <div class="row side-actions"><button id="r-play">Pause</button><button id="r-mode" aria-pressed="false">Show Whole Sentence</button></div>
+      </div>
+    </div>
+    <ol class="callouts">
+      <li><i class="k pick"></i><b>202</b> an expert this token goes to, darker for a bigger weight</li>
+      <li><i class="k shared"></i><b>204</b> also used by the token before</li>
+      <li><i class="k heat"></i><b>206</b> the sentence's total weight on that expert</li>
+    </ol>
+    <figcaption><b>Figure 2.</b> Router choices in Granite 3.0 1B-A400M, layers down and experts across.</figcaption>
+  </figure>
+</section>
+
+<section class="part" id="waves" aria-labelledby="waves-head">
+  <div class="text">
+    <h2 id="waves-head">GPU Waves</h2>
+    <p>A matrix multiply splits its output into tiles, and the GPU runs one tile per SM at a time. When the tile count isn't a multiple of the SM count, the last wave runs with part of the chip idle. Drag N and watch the efficiency in Figure 3 saw up and down.</p>
+    <p class="side-note">The lower plot sweeps N for the current M, tile and GPU. Each drop is a new, nearly empty last wave. Kernel libraries fight this with other tile shapes, split-K and persistent kernels.</p>
+  </div>
+  <figure id="figure-3" class="fig">
+    <div class="row controls-row">
+      <label class="f">GPU<select id="w-gpu"></select></label>
+      <label class="f">Tile<select id="w-tile"><option>64x64</option><option selected>128x128</option><option>128x256</option><option>256x128</option></select></label>
+      <label class="f" for="w-m"><span>M, rows <output id="w-m-v"></output></span><input id="w-m" type="range" min="64" max="4096" step="64" value="512"></label>
+      <label class="f" for="w-n"><span>N, columns <output id="w-n-v"></output></span><input id="w-n" type="range" min="128" max="32768" step="128" value="14336"></label>
+      <button id="w-play" class="go">Play the Waves</button>
+    </div>
+    <canvas id="w-sms" height="300" role="img" aria-label="SMs in the current wave"></canvas>
+    <dl class="readout">
+      <div><dt>output tiles</dt><dd id="w-tiles"></dd></div>
+      <div><dt>waves of work</dt><dd id="w-waves"></dd></div>
+      <div><dt>SMs busy in the last wave</dt><dd id="w-last"></dd></div>
+      <div><dt>of the chip's time used</dt><dd id="w-eff"></dd></div>
+    </dl>
+    <canvas id="w-saw" height="220" role="img" aria-label="Efficiency as N changes"></canvas>
+    <ol class="callouts">
+      <li><i class="k busy"></i><b>302</b> an SM running a tile</li>
+      <li><i class="k idle"></i><b>304</b> an SM idle in this wave</li>
+    </ol>
+    <figcaption><b>Figure 3.</b> Output tiles going out to the SMs wave by wave (top) and the share of the chip's time used as N grows (bottom).</figcaption>
+  </figure>
+</section>
+
+<footer>
+  <p>Source, traces and the README banners are on <a href="https://github.com/SomethingObvious/glassbox">GitHub</a>. Every number on this page comes from a real run or a public spec.</p>
+</footer>
+</main>
+<div class="tip" id="tip" role="status"></div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --group dev ruff check
+      - run: uv run --group dev ruff format --check
+      - run: uv run --group dev pytest -q
+      # The banners in assets/ must match what the saved traces draw.
+      - run: |
+          for banner in route draft waves; do uv run python -m glassbox "$banner"; done
+          git diff --exit-code assets
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx -y @biomejs/biome@2.5.15 ci docs
