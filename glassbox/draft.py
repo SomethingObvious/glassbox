@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from typing import NamedTuple, TypedDict
 
-from .svg import AMBER, BG, CYAN, GREEN, INK, LINE, MONO, MUTED, RED, Timeline, W, document, rect, text
+from .svg import FAINT, INK, LOST, MONO, SERIF, SHEET, SOFT, Timeline, W, callout, document, line, rect, text
 
 DRAFT, TARGET = "Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B"
 PROMPT = "In three sentences, explain why the sky is blue."
@@ -83,13 +83,16 @@ def layout(pieces: Sequence[str], x0: float, y0: float, right: float) -> list[Pl
     return out
 
 
-def chip(p: Placed, fill: str, ink: str, cls: str, edge: str = "") -> str:
-    stroke = f' stroke="{edge}" stroke-width="2"' if edge else ""
-    return (
-        f'<g class="{cls}">{rect(p.x - 1, p.y - 27, p.width + 2, 36, fill, 5, extra=stroke)}'
-        + text(p.x, p.y, p.text, 20, ink, font=MONO, weight=600)
-        + "</g>"
-    )
+def chip(p: Placed, kind: str, cls: str) -> str:
+    """A token box drawn the way the page draws it: dashed for a guess, solid if kept, red and struck if missed."""
+    box = {
+        "guess": rect(p.x - 2, p.y - 27, p.width + 4, 36, SHEET, stroke=INK, dash="5 4"),
+        "kept": rect(p.x - 2, p.y - 27, p.width + 4, 36, SHEET, stroke=INK),
+        "miss": rect(p.x - 2, p.y - 27, p.width + 4, 36, SHEET, stroke=LOST, width=2.5, dash="5 4"),
+    }[kind]
+    ink = LOST if kind == "miss" else INK
+    strike = line(p.x, p.y - 7, p.x + p.width, p.y - 7, LOST, 2) if kind == "miss" else ""
+    return f'<g class="{cls}">{box}{text(p.x, p.y, p.text, 20, ink, font=MONO)}{strike}</g>'
 
 
 def render(t: Trace) -> str:
@@ -97,16 +100,16 @@ def render(t: Trace) -> str:
     tl = Timeline(1.0 + STEP * len(steps) + 3.0)
     end = tl.period - 0.5
     body = [
-        text(60, 66, "Speculative decoding, one verify pass at a time", 34, weight=600),
+        text(60, 70, "Speculative Decoding, One Verify Pass at a Time", 34, weight=700, font=SERIF),
         text(
             60,
-            102,
+            106,
             f"Qwen3-0.6B guesses the next {depth} tokens, and Qwen3-1.7B checks all {depth} in a single forward "
             "pass. It keeps the guesses up to the first miss, then adds one token of its own.",
             19,
-            MUTED,
+            SOFT,
         ),
-        text(60, 152, f"Prompt: {t['prompt']}", 18, MUTED, font=MONO),
+        text(60, 156, f"Prompt: {t['prompt']}", 18, SOFT, font=MONO),
     ]
 
     # Committed text first. Guesses past a miss sit where later text lands, so padding covers the last pass.
@@ -115,7 +118,7 @@ def render(t: Trace) -> str:
         for s in steps
     ]
     written = [p for s in steps for p in [*s["drafted"][: s["kept"]], s["target"]]]
-    spots = layout(written + [" " * 6] * depth, MARGIN, 214, W - MARGIN)
+    spots = layout(written + [" " * 6] * depth, MARGIN, 218, W - MARGIN)
     hidden: list[str] = []
     start = 0
     for si, s in enumerate(steps):
@@ -126,27 +129,34 @@ def render(t: Trace) -> str:
             shown = guess.lstrip() if spot.x == MARGIN else guess
             p = Placed(spot.x, spot.y, CHAR * len(shown), shown)
             hidden.append(tl.show(f"g{si}_{j}", t0 + 0.08 * j, verify))
-            body.append(chip(p, "#10202a", CYAN, hidden[-1], CYAN))
+            body.append(chip(p, "guess", hidden[-1]))
             if j <= s["kept"]:
                 hidden.append(tl.show(f"v{si}_{j}", verify, settle))
-                body.append(chip(p, GREEN if j < s["kept"] else RED, BG, hidden[-1]))
+                body.append(chip(p, "kept" if j < s["kept"] else "miss", hidden[-1]))
         for j in range(s["kept"] + 1):
             spot = spots[start + j]
             hidden.append(tl.show(f"w{si}_{j}", settle, end))
+            own = j == s["kept"]
+            mark = (
+                line(spot.x, spot.y + 7, spot.x + spot.width, spot.y + 7, INK, 3) if own and spot.text.strip() else ""
+            )
             body.append(
-                text(spot.x, spot.y, spot.text, 20, AMBER if j == s["kept"] else INK, font=MONO, cls=hidden[-1])
+                f'<g class="{hidden[-1]}">'
+                f"{text(spot.x, spot.y, spot.text, 20, INK, font=MONO, weight=700 if own else 400)}{mark}</g>"
             )
         start += s["kept"] + 1
 
-    # One bar per big-model pass: green for kept guesses, amber for its own token.
+    # One bar per big-model pass: solid for kept guesses, outlined for its own token.
     by = max(p.y for p in spots) + 70
     bw = (W - 120) / len(steps)
-    body.append(text(60, by, "tokens gained per pass of the big model", 15, MUTED, font=MONO))
+    body.append(text(60, by, "tokens gained per pass of the big model", 15, SOFT))
     for si, s in enumerate(steps):
         x = 60 + si * bw
-        body.append(rect(x, by + 14, bw - 8, (depth + 1) * 18, LINE, 4))
+        body.append(rect(x, by + 14, bw - 8, (depth + 1) * 18, FAINT))
         cells = [
-            rect(x, by + 14 + (depth - j) * 18, bw - 8, 16, GREEN if j < s["kept"] else AMBER)
+            rect(x, by + 14 + (depth - j) * 18, bw - 8, 16, INK)
+            if j < s["kept"]
+            else rect(x + 1, by + 15 + (depth - j) * 18, bw - 10, 14, SHEET, stroke=INK, width=2)
             for j in range(s["kept"] + 1)
         ]
         hidden.append(tl.show(f"b{si}", 1.0 + si * STEP + 1.15, end))
@@ -154,29 +164,30 @@ def render(t: Trace) -> str:
 
     fy = by + 14 + (depth + 1) * 18 + 40
     kx = 60.0
-    for color, label in [
-        (CYAN, "guessed by the small model"),
-        (GREEN, "kept by the big model"),
-        (RED, "first miss"),
-        (AMBER, "the big model's own token"),
+    for draw, numeral, label in [
+        (lambda x: rect(x, fy - 15, 22, 16, stroke=INK, dash="4 3"), 102, "guessed by the small model"),
+        (lambda x: rect(x, fy - 15, 22, 16, stroke=INK), 104, "kept by the big model"),
+        (lambda x: rect(x, fy - 15, 22, 16, stroke=LOST, width=2, dash="4 3"), 106, "first miss, thrown away"),
+        (lambda x: line(x, fy, x + 22, fy, INK, 3), 108, "the big model's own token"),
     ]:
-        body += [rect(kx, fy - 14, 16, 16, color), text(kx + 24, fy, label, 17, MUTED)]
-        kx += 24 + 9.0 * len(label) + 40
+        entry, width = callout(kx, fy, draw(kx), numeral, label)
+        body.append(entry)
+        kx += width + 34
     body.append(
         text(
-            W - 60,
-            fy,
+            60,
+            fy + 36,
             f"{len(written)} tokens from {len(steps)} big-model passes, "
             f"{len(written) / len(steps):.2f} per pass instead of 1",
             17,
             INK,
-            "end",
-            weight=600,
+            "start",
+            weight=700,
         )
     )
     return document(
         "Speculative decoding: a small model guesses tokens and a big model checks them in one pass",
-        int(fy + 34),
+        int(fy + 76),
         tl.css(",".join(f".{c}" for c in hidden) + "{opacity:0}"),
         body,
     )

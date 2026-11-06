@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 
-from .svg import AMBER, BG, CYAN, INK, LINE, MONO, MUTED, RED, Timeline, W, document, rect, text
+from .svg import FAINT, INK, LOST, MONO, SERIF, SHEET, SOFT, Timeline, W, callout, document, rect, text
 
 
 @dataclass(frozen=True)
@@ -46,85 +46,94 @@ PERIOD, START, STEP = 15.0, 1.2, 2.7
 def render(p: Plan = PLAN) -> str:
     tl, end = Timeline(PERIOD), PERIOD - 0.6
     body = [
-        text(60, 66, "One matrix multiply on an H100", 34, weight=600),
+        text(60, 70, "One Matrix Multiply on an H100", 34, weight=700, font=SERIF),
         text(
             60,
-            102,
+            106,
             f"C = A × B with M = {p.m:,}, N = {p.n:,} and K = {K:,} in BF16. Its {p.tiles} output tiles of "
             f"{p.tile} × {p.tile} go out to {p.sms} SMs, one tile per SM at a time.",
             19,
-            MUTED,
+            SOFT,
         ),
     ]
     running, done, label, bar = [], [], [], []
     for w in range(p.waves):
         on, off = START + w * STEP, START + (w + 1) * STEP
-        running.append(tl.show(f"a{w}", on, off - 0.25))
-        done.append(tl.show(f"c{w}", off - 0.25, end, lit=0.55))
+        running.append(tl.show(f"a{w}", on, off - 0.25 if w < p.waves - 1 else end))
+        done.append(tl.show(f"c{w}", off - 0.25, end, lit=0.3))
         label.append(tl.show(f"l{w}", on, off - 0.05 if w < p.waves - 1 else end))
         bar.append(tl.show(f"b{w}", on, end))
     idle = tl.show("idle", START + (p.waves - 1) * STEP, end)
 
-    # Output matrix C: each tile lights while its wave runs, then stays as done.
-    x0, y0, cw = 60, 150, (W - 120) / p.cols
-    body.append(text(x0, y0 - 12, f"output C, {p.rows} × {p.cols} tiles", 15, MUTED, font=MONO))
+    # Output matrix C: each tile fills while its wave runs, then stays as a light wash once done.
+    x0, y0, cw = 60, 154, (W - 120) / p.cols
+    body.append(text(x0, y0 - 12, f"output C, {p.rows} × {p.cols} tiles", 15, SOFT))
     for i in range(p.tiles):
         r, c = divmod(i, p.cols)
         x, y, w = x0 + c * cw, y0 + r * cw, i // p.sms
         body += [
-            rect(x, y, cw - 2, cw - 2, LINE, 0),
-            rect(x, y, cw - 2, cw - 2, CYAN, 0, done[w]),
-            rect(x, y, cw - 2, cw - 2, AMBER, 0, running[w]),
+            rect(x, y, cw - 2, cw - 2, FAINT),
+            rect(x, y, cw - 2, cw - 2, INK, done[w]),
+            rect(x, y, cw - 2, cw - 2, INK, running[w]),
         ]
 
     # The SMs, 22 by 6, each showing the tile it runs in the current wave.
-    gx, gy, per_row, gap = 60, 250, 22, 8
+    gx, gy, per_row, gap = 60, 254, 22, 8
     side = (W - 120 - (per_row - 1) * gap) / per_row
-    body.append(text(gx, gy - 12, f"{p.sms} streaming multiprocessors", 15, MUTED, font=MONO))
+    body.append(text(gx, gy - 12, f"{p.sms} streaming multiprocessors", 15, SOFT))
     for s in range(p.sms):
         r, c = divmod(s, per_row)
         x, y = gx + c * (side + gap), gy + r * (side + gap)
-        body.append(rect(x, y, side, side, "#121925", 8, extra=f' stroke="{LINE}" stroke-width="2"'))
+        body.append(rect(x, y, side, side, stroke=FAINT))
         for w in range(p.waves):
             if s < p.busy(w):
                 body.append(
-                    f'<g class="{running[w]}">{rect(x, y, side, side, AMBER, 8)}'
-                    f"{text(x + side / 2, y + side / 2 + 12, f't{w * p.sms + s}', 15, BG, 'middle', 700, MONO)}</g>"
+                    f'<g class="{running[w]}">{rect(x, y, side, side, INK)}'
+                    f"{text(x + side / 2, y + side / 2 + 6, f't{w * p.sms + s}', 15, SHEET, 'middle', 700, MONO)}</g>"
                 )
         if s >= p.busy(p.waves - 1):
-            dash = f' stroke="{RED}" stroke-width="2.5" stroke-dasharray="6 5"'
-            body.append(rect(x + 3, y + 3, side - 6, side - 6, "none", 6, idle, dash))
-        body.append(text(x + 8, y + 20, f"{s}", 12, MUTED, font=MONO))
+            body.append(rect(x + 2, y + 2, side - 4, side - 4, cls=idle, stroke=LOST, width=2, dash="6 5"))
 
-    # Wave counter, then one timeline bar per wave filled to its share of busy SMs.
+    # Wave counter, then one bar per wave filled to its share of busy SMs.
     ly = gy + math.ceil(p.sms / per_row) * (side + gap) + 34
     for w in range(p.waves):
         n = p.busy(w)
         note = f"wave {w + 1} of {p.waves}: {n} of {p.sms} SMs busy"
         note += f", {p.sms - n} sit idle until it ends" if n < p.sms else ""
-        body.append(text(gx, ly, note, 22, RED if n < p.sms else INK, weight=600, cls=label[w]))
+        body.append(text(gx, ly, note, 22, LOST if n < p.sms else INK, weight=700, cls=label[w]))
     ty, bw = ly + 34, (W - 120 - (p.waves - 1) * 10) / p.waves
     for w in range(p.waves):
         x, share = gx + w * (bw + 10), p.busy(w) / p.sms
-        body.append(rect(x, ty, bw, 26, LINE, 5))
+        body.append(rect(x, ty, bw, 26, FAINT))
         body.append(
-            f'<g class="{bar[w]}">{rect(x, ty, bw * share, 26, AMBER, 5)}'
-            f"{text(x + 10, ty + 19, f'{100 * share:.0f}% busy', 15, BG, weight=700, font=MONO)}</g>"
+            f'<g class="{bar[w]}">{rect(x, ty, bw * share, 26, INK)}'
+            f"{text(x + 10, ty + 19, f'{100 * share:.0f}% busy', 15, SHEET, weight=700, font=MONO)}</g>"
         )
+    fy = ty + 66
+    kx = gx
+    for draw, numeral, label_text in [
+        (lambda x: rect(x, fy - 15, 22, 16, INK), 302, "an SM running a tile"),
+        (lambda x: rect(x, fy - 15, 22, 16, stroke=LOST, width=2, dash="4 3"), 304, "an SM idle in this wave"),
+    ]:
+        entry, width = callout(kx, fy, draw(kx), numeral, label_text)
+        body.append(entry)
+        kx += width + 34
     body.append(
         text(
-            gx,
-            ty + 66,
+            W - 60,
+            fy,
             f"{p.tiles / p.sms:.2f} waves of work take {p.waves} waves of time, so the GPU runs this multiply at "
-            f"{100 * p.efficiency:.0f}% of what its SMs could do.",
-            19,
-            MUTED,
+            f"{100 * p.efficiency:.0f}% of what its SMs could do",
+            17,
+            INK,
+            "end",
+            weight=700,
         )
     )
     hidden = ",".join(f".{c}" for c in [*running, *done, *label, *bar, idle])
     return document(
         "A matrix multiply's tiles going out to an H100's SMs in waves",
-        int(ty + 96),
+        int(fy + 40),
         tl.css(hidden + "{opacity:0}"),
         body,
     )
