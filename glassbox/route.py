@@ -4,8 +4,9 @@ import json
 import urllib.request
 from collections.abc import Sequence
 from itertools import pairwise
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
+from . import pieces
 from .svg import FAINT, INK, MONO, SERIF, SHEET, SOFT, Timeline, W, callout, document, rect, text
 
 MODEL = "ibm-granite/granite-3.0-1b-a400m-instruct"
@@ -36,6 +37,7 @@ class Trace(TypedDict):
     experts: int
     k: int
     runs: list[Run]
+    headline: NotRequired[dict[str, str]]  # the daily run's day and Hacker News link
 
 
 def trace(sentences: Sequence[str] = SENTENCES) -> Trace:
@@ -61,19 +63,20 @@ def trace(sentences: Sequence[str] = SENTENCES) -> Trace:
         ids = tok(sentence, return_tensors="pt").input_ids
         with torch.inference_mode():
             model(ids)
-        runs.append({"text": sentence, "tokens": [tok.decode([i]) for i in ids[0].tolist()], "layers": list(seen)})
+        runs.append({"text": sentence, "tokens": pieces(tok, ids[0].tolist()), "layers": list(seen)})
     return {"model": MODEL, "experts": model.config.num_local_experts, "k": k, "runs": runs}
 
 
-def headline() -> str:
-    """Today's top Hacker News story title."""
+def headline() -> tuple[str, str]:
+    """Today's top Hacker News story title and its discussion page."""
 
     def get(url: str) -> dict | list:
         with urllib.request.urlopen(url, timeout=30) as r:
             return json.load(r)
 
     top = get("https://hacker-news.firebaseio.com/v0/topstories.json")[0]
-    return get(f"https://hacker-news.firebaseio.com/v0/item/{top}.json")["title"]
+    title = get(f"https://hacker-news.firebaseio.com/v0/item/{top}.json")["title"]
+    return title, f"https://news.ycombinator.com/item?id={top}"
 
 
 def render(t: Trace, subtitle: str = "") -> str:

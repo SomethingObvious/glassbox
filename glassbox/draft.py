@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from typing import NamedTuple, TypedDict
 
+from . import pieces
 from .svg import FAINT, INK, LOST, MONO, SERIF, SHEET, SOFT, Timeline, W, callout, document, line, rect, text
 
 DRAFT, TARGET = "Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B"
@@ -52,6 +53,7 @@ def trace() -> Trace:
         [{"role": "user", "content": PROMPT}], tokenize=False, add_generation_prompt=True, enable_thinking=False
     )
     ids = tok(chat, return_tensors="pt").input_ids[0].to(dev)
+    start = len(ids)
     steps: list[Step] = []
     with torch.inference_mode():
         for _ in range(STEPS):
@@ -59,11 +61,13 @@ def trace() -> Trace:
             # One big-model pass scores the position after every guess at once.
             wants = big(torch.cat([ids, guesses])[None]).logits[0, len(ids) - 1 :].argmax(-1)
             kept = accepted(guesses.tolist(), wants.tolist())
+            # Spelled after what is already written, so a character split across passes comes out whole.
+            said = ids[start:].tolist()
             steps.append(
                 {
-                    "drafted": [tok.decode([i]) for i in guesses.tolist()],
+                    "drafted": pieces(tok, said + guesses.tolist())[len(said) :],
                     "kept": kept,
-                    "target": tok.decode([wants[kept]]),
+                    "target": pieces(tok, [*said, *guesses[:kept].tolist(), int(wants[kept])])[-1],
                 }
             )
             ids = torch.cat([ids, guesses[:kept], wants[kept : kept + 1]])

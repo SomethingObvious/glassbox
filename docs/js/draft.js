@@ -8,6 +8,52 @@ const TARGET = "Exempliss/Qwen3-1.7B-ONNX-Split";
 const TARGET_REVISION = "f9b9656836a4315a690d0270f885b0758923bd13";
 const STOP = new Set([151643, 151645]); // Qwen3 <|endoftext|> and <|im_end|>
 
+// Byte-level BPE spells every byte as a printable character. This maps them back.
+const BYTES = new Map();
+for (let b = 0, extra = 0; b < 256; b++) {
+  const printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174;
+  BYTES.set(String.fromCodePoint(printable ? b : 256 + extra++), b);
+}
+const utf8 = new TextDecoder();
+
+/** How much of `buf` is whole UTF-8 characters, leaving out a character cut off at the end. */
+function whole(buf) {
+  for (let i = buf.length - 1; i >= Math.max(buf.length - 3, 0); i--) {
+    // A continuation byte, so the character starts further back.
+    if ((buf[i] & 0xc0) === 0x80) continue;
+    const need = buf[i] >= 0xf0 ? 4 : buf[i] >= 0xe0 ? 3 : buf[i] >= 0xc0 ? 2 : 1;
+    return buf[i] < 0xf8 && buf.length - i < need ? i : buf.length;
+  }
+  return buf.length;
+}
+
+/**
+ * Each token's text from its bytes. A character split over tokens goes on the token that finishes it, and the bytes a
+ * token holds of a character it doesn't finish show as escapes, so a split emoji isn't two replacement characters.
+ */
+export function spell(raw) {
+  let carry = [];
+  return raw.map((piece) => {
+    const buf = Uint8Array.from([...carry, ...piece]);
+    const cut = whole(buf);
+    carry = [...buf.subarray(cut)];
+    const part = piece.length ? carry.slice(-piece.length) : [];
+    const escapes = part.map((b) => `\\x${b.toString(16).toUpperCase().padStart(2, "0")}`).join("");
+    return utf8.decode(buf.subarray(0, cut)) + escapes;
+  });
+}
+
+/** `spell` for Qwen3 token ids, with special tokens left out. */
+function pieces(ids) {
+  // _tokenizer is private, though the library is pinned to one version above.
+  const raw = ids.map((id) =>
+    state.tok.all_special_ids.includes(id)
+      ? []
+      : Array.from(state.tok._tokenizer.id_to_token(id), (c) => BYTES.get(c) ?? 63),
+  );
+  return spell(raw);
+}
+
 const state = {
   lib: null,
   tok: null,
@@ -145,7 +191,8 @@ async function topTwo(ids) {
   const row = logits.data.subarray((ids.length - 1) * vocab, ids.length * vocab);
   const order = [...row.keys()].sort((a, b) => row[b] - row[a]).slice(0, 2);
   logits.dispose?.();
-  return order.map((id) => ({ text: state.tok.decode([id]), logit: Number(row[id]) }));
+  const said = ids.slice(state.promptLength);
+  return order.map((id) => ({ text: pieces([...said, id]).at(-1), logit: Number(row[id]) }));
 }
 
 async function guess(ids, depth) {
@@ -181,10 +228,12 @@ async function run() {
       const wants = await check(ids.concat(guesses), ids.length - 1);
       const kept = accepted(guesses, wants);
       const added = [...guesses.slice(0, kept), wants[kept]];
+      // Spelled after what is already written, so a character split across passes comes out whole.
+      const said = ids.slice(state.promptLength);
       const step = {
-        drafted: guesses.map((id) => state.tok.decode([id], { skip_special_tokens: true })),
+        drafted: pieces([...said, ...guesses]).slice(said.length),
         kept,
-        target: state.tok.decode([wants[kept]], { skip_special_tokens: true }),
+        target: pieces([...said, ...added]).at(-1),
       };
       steps.push(step);
       await playStep(step, calm ? 0 : 160);

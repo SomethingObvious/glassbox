@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from glassbox import draft, route, waves
+from glassbox import draft, route, spell, waves
 from glassbox.svg import Timeline
 
 DATA = Path(__file__).resolve().parent.parent / "docs" / "data"
@@ -49,14 +49,27 @@ def test_saved_traces_render(name):
     path = DATA / f"{name}.json"
     if not path.exists():
         pytest.skip(f"{path.name} not traced yet")
-    svg = (route if name == "route" else draft).render(json.loads(path.read_text()))
+    svg = (route if name == "route" else draft).render(json.loads(path.read_text(encoding="utf-8")))
     assert svg.startswith("<svg") and svg.endswith("</svg>")
 
 
 def test_route_trace_is_consistent():
-    t = json.loads((DATA / "route.json").read_text())
+    t = json.loads((DATA / "route.json").read_text(encoding="utf-8"))
     for run in t["runs"]:
         for layer in run["layers"]:
             assert len(layer["experts"]) == len(run["tokens"])
             assert all(len(set(row)) == t["k"] for row in layer["experts"])
             assert all(abs(sum(w) - 1) < 1e-3 for w in layer["weights"])
+
+
+def test_spell_puts_a_split_character_on_the_token_that_finishes_it():
+    rocket = "\N{ROCKET}"
+    raw = rocket.encode()
+    assert spell([b"Launch", b" " + raw[:2], raw[2:3], raw[3:]]) == ["Launch", r" \xF0\x9F", r"\x9A", rocket]
+    assert spell(["café".encode(), b" ok"]) == ["café", " ok"]
+    assert spell([b"\xff", b"ok"]) == ["\N{REPLACEMENT CHARACTER}", "ok"]
+
+
+def test_saved_traces_have_no_replacement_characters():
+    for name in ["route", "draft"]:
+        assert "\N{REPLACEMENT CHARACTER}" not in (DATA / f"{name}.json").read_text(encoding="utf-8")

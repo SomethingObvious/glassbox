@@ -4,9 +4,9 @@
 
 Animated pictures of what happens inside LLM inference, drawn from real runs of small public models. Every banner is a single SVG with CSS animation, so it plays in a README with no JavaScript, and each one opens an [interactive version](https://somethingobvious.github.io/glassbox/) where the speculative decoding demo runs two real models on your own GPU through WebGPU.
 
-<a href="https://somethingobvious.github.io/glassbox/#route"><img src="assets/route.svg" width="100%" alt="A mixture-of-experts router picking 8 of 32 experts for each token in every layer"></a>
+<a href="https://somethingobvious.github.io/glassbox/#route"><img src="https://raw.githubusercontent.com/SomethingObvious/glassbox/live/route.svg" width="100%" alt="Today's top Hacker News headline going through a mixture-of-experts router, each token picking 8 of 32 experts in every layer"></a>
 
-IBM Granite 3.0 1B-A400M's router sends every token to 8 of its 32 experts in each of 24 layers. These are the real router choices from one forward pass, and a [daily workflow](.github/workflows/headline.yml) routes the top Hacker News headline the same way and publishes it to the `live` branch.
+IBM Granite 3.0 1B-A400M's router sends every token to 8 of its 32 experts in each of 24 layers. Every morning a [workflow](.github/workflows/headline.yml) routes the top Hacker News headline through one real forward pass, publishes the banner and its trace to the `live` branch, and the page opens Figure 2 on it.
 
 <a href="https://somethingobvious.github.io/glassbox/#draft"><img src="assets/draft.svg" width="100%" alt="Qwen3-0.6B guessing tokens and Qwen3-1.7B checking four at a time"></a>
 

@@ -125,14 +125,39 @@ function show(j) {
       : `It shares ${(shared / run.layers.length).toFixed(1)} of its ${state.trace.k} experts per layer with the token before it.`;
 }
 
+/** Today's top Hacker News headline, which a daily workflow routes and pushes to the live branch. */
+async function headline() {
+  try {
+    const live = await json(LIVE);
+    const { day, link } = live.headline;
+    const note = $("r-live");
+    note.replaceChildren(
+      `The first sentence is today's top `,
+      Object.assign(document.createElement("a"), { href: link, textContent: "Hacker News headline" }),
+      `, routed on ${day} by a daily workflow that runs the same model.`,
+    );
+    note.hidden = false;
+    return { ...live.runs[0], live: true };
+  } catch {
+    // The saved sentences are enough on their own.
+    return null;
+  }
+}
+
+const LIVE = "https://raw.githubusercontent.com/SomethingObvious/glassbox/live/route.json";
+
 export async function initRoute() {
-  state.trace = await json("data/route.json");
+  const [saved, today] = await Promise.all([json("data/route.json"), headline()]);
+  state.trace = saved;
+  if (today) saved.runs.unshift(today);
   const { runs, experts } = state.trace;
   $("r-runs").replaceChildren(
     ...runs.map((run, i) => {
+      const label = run.live ? `Today on HN: ${run.text}` : run.text;
       const chip = Object.assign(document.createElement("button"), {
         className: "chip",
-        textContent: run.text.length > 34 ? `${run.text.slice(0, 32)}...` : run.text,
+        textContent: label.length > 34 ? `${label.slice(0, 32)}...` : label,
+        title: run.text,
       });
       chip.addEventListener("click", () => pickRun(i));
       return chip;
