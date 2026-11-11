@@ -6,8 +6,8 @@ the two numbers attention reads from it, and the KV cache is one fixed buffer pe
 rows into. A guess the big model turns down needs no cleanup, as the next pass writes over its row.
 
 The big graph writes alone, one token a pass. The pass graph checks one guess and runs the EAGLE-3 head right after
-the big model on what it read, so it guesses after every row in the same call. Which guess comes next is only known
-once the big model's picks are back on the CPU, which is where the loop picks it.
+the big model on what it read, so it guesses after every row in the same call. It also works out which rows the
+next pass reads, as the page starts that pass before the picks of this one are back on the CPU.
 """
 
 import json
@@ -264,6 +264,58 @@ def joined(model: "onnx.ModelProto", step: "onnx.ModelProto") -> None:
     g.input.extend([helper.make_tensor_value_info(f"head_{kv}", TensorProto.FLOAT16, cache) for kv in "kv"])
 
 
+def chained(model: "onnx.ModelProto") -> None:
+    """Gives the pass graph `joined` made the next pass's inputs as outputs, each named `then_` and the input.
+
+    The page copies them across on the GPU, so the next pass can start while this one's picks are still on their
+    way back. The guess was kept if it is the big model's pick after the last token. The next pass then reads the
+    pick and the guess after the guess, one row further on, and otherwise the two after the last token.
+    """
+    import numpy as np
+    from onnx import TensorProto, helper, numpy_helper
+
+    g = model.graph
+    g.initializer.extend(
+        [
+            numpy_helper.from_array(np.array([0], np.int64), "then/first"),
+            numpy_helper.from_array(np.array([1], np.int64), "then/second"),
+            numpy_helper.from_array(np.array([1, ROWS], np.int64), "then/row"),
+        ]
+    )
+
+    def node(kind: str, inputs: list[str], out: str, **attrs: object) -> "onnx.NodeProto":
+        return helper.make_node(kind, inputs, [out], name=out, **attrs)
+
+    g.node.extend(
+        [
+            node("Gather", ["input_ids", "then/second"], "then/guess", axis=1),
+            node("Gather", ["wants", "then/first"], "then/want", axis=1),
+            node("Equal", ["then/guess", "then/want"], "then/kept"),
+            node("Cast", ["then/kept"], "then/k", to=TensorProto.INT64),
+            # Column 0 holds the pick and the guess after the last token, and column 1 those after the guess. They
+            # go through floats, which hold a token id exactly, as WebGPU's Concat returns other memory for int64.
+            node("Cast", ["guesses"], "then/guesses", to=TensorProto.FLOAT),
+            node("Concat", ["wants/first", "then/guesses"], "then/both", axis=0),
+            node("Gather", ["then/both", "then/k"], "then/column", axis=1),
+            node("Reshape", ["then/column", "then/row"], "then/ids"),
+            node("Cast", ["then/ids"], "then_input_ids", to=TensorProto.INT64),
+            node("Add", ["then/k", "then/second"], "then/step"),
+            node("Add", ["position_ids", "then/step"], "then_position_ids"),
+            node("Cast", ["then/step"], "then/step32", to=TensorProto.INT32),
+            node("Add", ["seqlens", "then/step32"], "then_seqlens"),
+            node("Add", ["total", "then/step32"], "then_total"),
+        ]
+    )
+    g.output.extend(
+        [
+            helper.make_tensor_value_info("then_input_ids", TensorProto.INT64, [1, ROWS]),
+            helper.make_tensor_value_info("then_position_ids", TensorProto.INT64, [1, ROWS]),
+            helper.make_tensor_value_info("then_seqlens", TensorProto.INT32, [1, 1]),
+            helper.make_tensor_value_info("then_total", TensorProto.INT32, [1, 1]),
+        ]
+    )
+
+
 def _empty(session: "ort.InferenceSession") -> dict[str, "np.ndarray"]:
     import numpy as np
 
@@ -326,6 +378,9 @@ def guessed(
         kept = accepted(guesses, wants)
         # The head guessed after every row, and the one after the last right row is next.
         after = int(got["guesses"][0, kept])
+        at = len(seq) + kept
+        then = [got[f"then_{name}"].ravel().tolist() for name in ("input_ids", "position_ids", "seqlens", "total")]
+        assert then == [[wants[kept], after], [at, at + 1], [at + 1], [at + 2]], f"the graph would read {then} next"
         # A kept guess can end the answer, and nothing guessed after it counts.
         if (end := next((j for j, g in enumerate(guesses[:kept]) if g in stop), None)) is not None:
             guesses = guesses[:end]
@@ -368,6 +423,7 @@ def export(out: Path) -> None:
     quantizer = MatMulNBitsQuantizer(head(load_file(hf_hub_download(**HEAD))), bits=4, block_size=32, is_symmetric=True)
     quantizer.process()
     joined(graph, quantizer.model.model)
+    chained(graph)
     files[2].unlink(missing_ok=True)  # onnx will not write over an old one
     onnx.save(graph, str(files[1]), save_as_external_data=True, location=files[2].name)
 

@@ -9,11 +9,14 @@ const TARGET_REVISION = "f9b9656836a4315a690d0270f885b0758923bd13";
 const WEIGHTS = `https://huggingface.co/${TARGET}/resolve/${TARGET_REVISION}/onnx/model_q4f16.onnx_data`;
 // That graph alone and with the head after it, both made for graph capture by `python -m switchboard head`.
 const HEAD =
-  "https://huggingface.co/hoyporti/qwen3-1.7b-eagle3-switchboard/resolve/d9cbc9b3c9a73b1b71d746cfc15c64d6f9a620a3/onnx";
+  "https://huggingface.co/hoyporti/qwen3-1.7b-eagle3-switchboard/resolve/f6b6619abd92b8ae3e2bb55f75c02d70d617f3a7/onnx";
 const STOP = new Set([151643, 151645]); // Qwen3 <|endoftext|> and <|im_end|>
 // Checking more rows a pass costs WebGPU more than a second guess earns, as the second is right far less often.
 const GUESSES = 1;
 const ENTRIES = 1024; // cache rows on the GPU, the most a prompt and its answer can fill
+// Passes on the GPU at once. A pick takes about 2 ms to reach the CPU, and with one pass at a time the GPU waits it out.
+const DEPTH = 2;
+const TRIAL = 24; // passes the head gets before it can be switched off for writing slower than alone
 
 const state = {
   ort: null,
@@ -195,15 +198,16 @@ async function loadModels() {
   status("Loading the model onto the GPU...", 1);
   const hosted = { path: "model_q4f16.onnx_data", data: weights };
   state.big = await captured(graph, [hosted], 1);
-  state.pass = await captured(pass, [hosted, { path: "head.onnx.data", data: headWeights }], 2);
+  state.pass = await captured(pass, [hosted, { path: "head.onnx.data", data: headWeights }], 2, state.big);
 }
 
 /**
  * A session that WebGPU replays from recorded commands, so a pass costs no CPU time per kernel. That needs fixed
  * shapes and every input and output in a GPU buffer, which each pass writes and reads in place: `rows` tokens in,
- * and one cache buffer per layer that is both the past and the present.
+ * and one cache buffer per layer that is both the past and the present. It shares the big model's cache buffers
+ * with `kin`, so either session can carry on from where the other stopped.
  */
-async function captured(bytes, externalData, rows) {
+async function captured(bytes, externalData, rows, kin) {
   const ort = state.ort;
   // As a plain string the provider never hears about graph capture, though the session still acts as if it did.
   const session = await ort.InferenceSession.create(bytes, {
@@ -228,9 +232,18 @@ async function captured(bytes, externalData, rows) {
     wants: ["int64", [1, rows], 8],
     guesses: ["int64", [1, rows], 8],
     logits_fp16: ["float16", [1, rows, 151936], 2],
+    then_input_ids: ["int64", [1, rows], 8],
+    then_position_ids: ["int64", [1, rows], 8],
+    then_seqlens: ["int32", [1, 1], 4],
+    then_total: ["int32", [1, 1], 4],
   };
   const cache = ["float16", [1, 8, ENTRIES, 128], 2];
-  const feeds = Object.fromEntries(session.inputNames.map((name) => [name, tensor(...(shapes[name] ?? cache))]));
+  const feeds = Object.fromEntries(
+    session.inputNames.map((name) => [
+      name,
+      shapes[name] ? tensor(...shapes[name]) : (kin?.feeds[name] ?? tensor(...cache)),
+    ]),
+  );
   // The new cache rows are written into the old cache's buffer.
   const fetches = Object.fromEntries(
     session.outputNames.map((name) => {
@@ -238,7 +251,13 @@ async function captured(bytes, externalData, rows) {
       return [name, feeds[past] ?? tensor(...shapes[name])];
     }),
   );
-  const s = { session, feeds, fetches, rows, device };
+  // What the next pass reads is among this pass's outputs. The pass graph works all of it out as `then_` and the
+  // input's name, and alone it is only the pick.
+  const links = session.outputNames
+    .filter((name) => name.startsWith("then_"))
+    .map((name) => [fetches[name], feeds[name.slice(5)]]);
+  if (!links.length) links.push([fetches.wants, feeds.input_ids]);
+  const s = { session, feeds, fetches, rows, device, links };
   const buffers = [...Object.values(feeds), ...Object.values(fetches)].map((t) => t.gpuBuffer);
   await pinned(buffers, () => feed(s, Array(rows).fill(0), 0));
   return s;
@@ -268,8 +287,11 @@ async function pinned(buffers, first) {
   }
 }
 
-/** Copies GPU buffers back to the CPU in one trip, as the bytes of each. */
-async function readBack({ device }, tensors) {
+/**
+ * Starts GPU buffers on one trip back to the CPU, as the bytes of each. The copies in `links`, each a GPU buffer and
+ * the one it is written over, go in the same trip.
+ */
+function readBack({ device }, tensors, links = []) {
   const sizes = tensors.map((t) => t.gpuBuffer.size);
   const staging = device.createBuffer({
     size: sizes.reduce((a, b) => a + b),
@@ -278,51 +300,93 @@ async function readBack({ device }, tensors) {
   const encoder = device.createCommandEncoder();
   const starts = sizes.map((_, i) => sizes.slice(0, i).reduce((a, b) => a + b, 0));
   for (const [i, t] of tensors.entries()) encoder.copyBufferToBuffer(t.gpuBuffer, 0, staging, starts[i], sizes[i]);
+  for (const [from, to] of links) encoder.copyBufferToBuffer(from.gpuBuffer, 0, to.gpuBuffer, 0, from.gpuBuffer.size);
   device.queue.submit([encoder.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const all = staging.getMappedRange().slice(0);
-  staging.destroy();
-  return sizes.map((size, i) => all.slice(starts[i], starts[i] + size));
+  return staging.mapAsync(GPUMapMode.READ).then(() => {
+    const all = staging.getMappedRange().slice(0);
+    staging.destroy();
+    return sizes.map((size, i) => all.slice(starts[i], starts[i] + size));
+  });
 }
 
 const since = (start) => (performance.now() - start) / 1000;
 
-/**
- * One pass over `ids`, exactly `rows` of them, written into the caches at position `at`. Where `nexts` gives the
- * token after a row, the head reads it in place of the big model's pick. `wants` is the big model's pick after each
- * row and `guesses` the head's.
- */
-async function feed(s, ids, at, nexts = []) {
-  const put = (name, values) => {
-    const bytes = new Uint8Array(Math.ceil(values.byteLength / 4) * 4);
-    bytes.set(new Uint8Array(values.buffer, values.byteOffset, values.byteLength));
-    s.device.queue.writeBuffer(s.feeds[name].gpuBuffer, 0, bytes);
-  };
-  put("input_ids", BigInt64Array.from(ids, BigInt));
+function put(s, name, values) {
+  const bytes = new Uint8Array(Math.ceil(values.byteLength / 4) * 4);
+  bytes.set(new Uint8Array(values.buffer, values.byteOffset, values.byteLength));
+  s.device.queue.writeBuffer(s.feeds[name].gpuBuffer, 0, bytes);
+}
+
+/** Has the next pass write its rows into the caches from position `at`. */
+function seat(s, at) {
   put(
+    s,
     "position_ids",
-    BigInt64Array.from(ids, (_, i) => BigInt(at + i)),
+    BigInt64Array.from({ length: s.rows }, (_, i) => BigInt(at + i)),
   );
-  put("seqlens", Int32Array.of(at + ids.length - 1));
-  put("total", Int32Array.of(at + ids.length));
+  put(s, "seqlens", Int32Array.of(at + s.rows - 1));
+  put(s, "total", Int32Array.of(at + s.rows));
+}
+
+/**
+ * Has the next pass read `ids`, exactly `rows` of them, at position `at`. Where `nexts` gives the token after a row,
+ * the head reads it in place of the big model's pick.
+ */
+function place(s, ids, at, nexts = []) {
+  put(s, "input_ids", BigInt64Array.from(ids, BigInt));
+  seat(s, at);
   if (s.feeds.given) {
     put(
+      s,
       "given",
       Uint8Array.from(ids, (_, i) => (nexts[i] === undefined ? 0 : 1)),
     );
     put(
+      s,
       "next_ids",
       BigInt64Array.from(ids, (_, i) => BigInt(nexts[i] ?? 0)),
     );
   }
-  await s.session.run(s.feeds, s.fetches);
+}
+
+/**
+ * Starts the last pass's picks on their way back: `wants` is the big model's pick after each row and `guesses` the
+ * head's. The same trip leaves what the next pass reads in the input buffers.
+ */
+function picks(s) {
   const names = s.fetches.guesses ? ["wants", "guesses"] : ["wants"];
-  const [wants, guesses] = await readBack(
+  const ints = (bytes) => (bytes ? Array.from(new BigInt64Array(bytes, 0, s.rows), Number) : []);
+  return readBack(
     s,
     names.map((name) => s.fetches[name]),
-  );
-  const ints = (bytes) => (bytes ? Array.from(new BigInt64Array(bytes, 0, s.rows), Number) : []);
-  return { wants: ints(wants), guesses: ints(guesses) };
+    s.links,
+  ).then(([wants, guesses]) => ({ wants: ints(wants), guesses: ints(guesses) }));
+}
+
+/** One pass over `ids` at position `at`, as `place` reads them, and its picks. */
+async function feed(s, ids, at, nexts = []) {
+  place(s, ids, at, nexts);
+  await s.session.run(s.feeds, s.fetches);
+  return picks(s);
+}
+
+/**
+ * Runs `s` pass after pass, each on what the one before left in the input buffers, and gives every pass's picks to
+ * `each` in order until it returns false. `DEPTH` passes are on the GPU at once, so it never waits for the CPU to
+ * hear how a pass went, and the passes started past the last one wanted are thrown away. `seat` is called before
+ * each pass starts.
+ */
+async function queued(s, seat, each) {
+  const flying = [];
+  for (let more = true; more; ) {
+    while (flying.length < DEPTH) {
+      seat();
+      await s.session.run(s.feeds, s.fetches);
+      flying.push(picks(s));
+    }
+    more = each(await flying.shift());
+  }
+  await Promise.all(flying);
 }
 
 /** Reads the prompt `s.rows` tokens a pass, the last pass starting early so it is whole. */
@@ -347,44 +411,82 @@ async function read(s, prompt) {
 /**
  * The loop of switchboard/eagle.py over the pass graph, one guess at a time. Each pass is its guesses, how many
  * were kept, the big model's own token and its seconds. Both ways start their clocks once the prompt is read, which
- * the pass graph does two tokens a pass and the big graph one.
+ * the pass graph does two tokens a pass and the big graph one. The graph picks the next pass's rows the way this
+ * loop does, so the loop only follows along. Once the head has cost more time than `pace`, the seconds a token
+ * takes alone, would have, the rest is written without it.
  */
-async function guessed(prompt, most, each = () => {}) {
-  let got = await read(state.pass, prompt);
+async function guessed(prompt, most, pace = 0, each = () => {}) {
+  const got = await read(state.pass, prompt);
   const seq = [...prompt, got.wants.at(-1)];
   const passes = [{ guesses: [], kept: 0, own: seq.at(-1), seconds: 0 }];
-  let guesses = got.guesses.slice(-1);
-  while (!STOP.has(seq.at(-1)) && seq.length - prompt.length < most) {
-    const start = performance.now();
-    got = await feed(state.pass, [seq.at(-1), ...guesses], seq.length - 1);
-    let kept = accepted(guesses, got.wants);
-    // The head guessed after every row, and the one after the last right row is next.
-    const after = got.guesses[kept];
-    // A kept guess can end the answer, and nothing guessed after it counts.
-    const end = guesses.slice(0, kept).findIndex((id) => STOP.has(id));
-    if (end >= 0) {
-      guesses = guesses.slice(0, end);
-      kept = end;
-    }
-    seq.push(...guesses.slice(0, kept), got.wants[kept]);
-    passes.push({ guesses, kept, own: got.wants[kept], seconds: since(start) });
+  const more = () => !STOP.has(seq.at(-1)) && seq.length - prompt.length < most;
+  let start = performance.now();
+  const wrote = (guesses, kept, own) => {
+    seq.push(...guesses.slice(0, kept), own);
+    passes.push({ guesses, kept, own, seconds: since(start) });
+    start = performance.now();
     each(passes);
-    guesses = [after];
-  }
+  };
+  let guesses = got.guesses.slice(-1);
+  let behind = false;
+  if (!more()) return passes;
+  place(state.pass, [seq.at(-1), ...guesses], seq.length - 1);
+  await queued(
+    state.pass,
+    () => {},
+    (got) => {
+      let kept = accepted(guesses, got.wants);
+      // The head guessed after every row, and the one after the last right row is next.
+      const after = got.guesses[kept];
+      // A kept guess can end the answer, and nothing guessed after it counts.
+      const end = guesses.slice(0, kept).findIndex((id) => STOP.has(id));
+      if (end >= 0) {
+        guesses = guesses.slice(0, end);
+        kept = end;
+      }
+      wrote(guesses, kept, got.wants[kept]);
+      guesses = [after];
+      behind = passes.length > TRIAL && secondsIn(passes) > pace * (seq.length - prompt.length - 1);
+      return more() && !(pace && behind);
+    },
+  );
+  if (!more()) return passes;
+  // ponytail: the head stays off for the rest of the answer. Its own cache has no rows for tokens written without
+  // it, so turning it back on would need those rows filled in first.
+  let at = seq.length - 1;
+  place(state.big, [seq.at(-1)], at);
+  await queued(
+    state.big,
+    () => seat(state.big, at++),
+    ({ wants }) => {
+      wrote([], 0, wants[0]);
+      return more();
+    },
+  );
   return passes;
 }
 
-/** The big model's next `n` greedy tokens, one pass each, and the seconds each pass took. */
+/** The big model's greedy tokens, one pass each, up to `n` of them or the end of its answer, and each one's seconds. */
 async function alone(prompt, n, each = () => {}) {
-  const seq = [...prompt, (await read(state.big, prompt)).wants[0]];
+  // The pass that read the end of the prompt left its pick where the next pass reads.
+  const tokens = [(await read(state.big, prompt)).wants[0]];
   const times = [0];
-  while (times.length < n) {
-    const start = performance.now();
-    seq.push((await feed(state.big, seq.slice(-1), seq.length - 1)).wants[0]);
-    times.push(since(start));
-    each(times);
-  }
-  return { tokens: seq.slice(prompt.length), times };
+  const more = () => tokens.length < n && !STOP.has(tokens.at(-1));
+  if (!more()) return { tokens, times };
+  let at = prompt.length;
+  let start = performance.now();
+  await queued(
+    state.big,
+    () => seat(state.big, at++),
+    ({ wants }) => {
+      tokens.push(wants[0]);
+      times.push(since(start));
+      start = performance.now();
+      each(times);
+      return more();
+    },
+  );
+  return { tokens, times };
 }
 
 /** The big model's two best tokens after `ids`, as text with their logits. It wrote the last `said` of them. */
@@ -428,21 +530,25 @@ async function run() {
       enable_thinking: false,
     });
     const prompt = state.tok.encode(chat, { add_special_tokens: false });
-    // The pass graph writes one row past the answer, a guess it may turn down.
-    const room = ENTRIES - prompt.length - 2;
+    // A pass writes a row for its guess, and the passes still on the GPU when the answer ends write past it too.
+    const room = ENTRIES - prompt.length - 2 * (DEPTH + 2);
     if (room < 16) throw new Error(`the prompt is ${prompt.length} tokens, and this run has room for ${ENTRIES}`);
     resetStats(depth);
     // The first passes of each shape compile shaders, so both ways get a few before the clock counts.
     status("Warming up...", 1);
     await guessed(prompt, 8);
     await alone(prompt, 3);
-    const passes = await guessed(prompt, Math.min(most, room), (done) =>
-      status(`Writing with guesses on this GPU, ${tokensIn(done)} tokens so far...`),
+    // Alone goes first, so the guessed run knows the pace it has to beat. A last pass that keeps its guess writes
+    // one token more than asked for, which alone writes too.
+    const solo = await alone(prompt, Math.min(most, room) + 1, (done) =>
+      status(`Writing alone on this GPU, ${done.length} tokens so far...`),
+    );
+    const pace = solo.times.reduce((a, b) => a + b) / (solo.times.length - 1);
+    const passes = await guessed(prompt, Math.min(most, room), pace, (done) =>
+      status(`Writing the same answer with guesses, ${tokensIn(done)} tokens so far...`),
     );
     const ours = passes.flatMap((pass) => [...pass.guesses.slice(0, pass.kept), pass.own]);
-    const solo = await alone(prompt, ours.length, (done) =>
-      status(`Writing the same ${ours.length} tokens alone, ${done.length} so far...`),
-    );
+    solo.times.length = Math.min(solo.times.length, ours.length);
     const same = accepted(ours, solo.tokens);
     const written = [];
     const steps = passes.map(({ guesses, kept, own, seconds }) => {
@@ -461,9 +567,11 @@ async function run() {
     trace = { draft: "EAGLE-3 head", target: "Qwen/Qwen3-1.7B", prompt: text, depth, steps, timing };
     if (timing.same) {
       const total = (times) => times.reduce((a, b) => a + b, 0).toFixed(2);
+      const off = passes.findIndex((pass, i) => i && !pass.guesses.length);
       said =
         `Written on this GPU just now. The same ${ours.length} tokens took ${secondsIn(steps).toFixed(2)} s with ` +
-        `the head guessing one token a pass and ${total(solo.times)} s alone, both after reading the prompt.`;
+        `the head guessing one token a pass and ${total(solo.times)} s alone, both after reading the prompt.` +
+        (off < 0 ? "" : ` Its guesses cost more time than they saved, so it was switched off after ${off - 1} passes.`);
     } else {
       const [a, b] = await topTwo([...prompt, ...ours.slice(0, same)], same);
       said =
