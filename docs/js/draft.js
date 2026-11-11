@@ -35,8 +35,9 @@ export function accepted(guesses, wants) {
   return kept;
 }
 
+/** `message` is text, or a list of text and elements. */
 function status(message, progress) {
-  $("d-status").textContent = message;
+  $("d-status").replaceChildren(...[message].flat());
   if (progress !== undefined) $("d-bar").style.transform = `scaleX(${progress})`;
 }
 
@@ -482,9 +483,16 @@ async function run() {
 async function replay(keepStatus = false) {
   try {
     const trace = await json(TODAY).catch(() => json("data/draft.json"));
-    const what = trace.headline ? "Today's top Hacker News headline, explained" : "A recorded run";
     const who = `${trace.target.split("/").pop()}, its ${trace.draft} guessing ${trace.depth} tokens a pass`;
-    await play(trace, keepStatus ? null : `${what} by ${who}.`);
+    const { title, link, day } = trace.headline ?? {};
+    const said = title
+      ? [
+          `Today's top Hacker News headline${day ? ` (${day})` : ""}, `,
+          Object.assign(document.createElement("a"), { href: link, textContent: title }),
+          `, explained by ${who}.`,
+        ]
+      : `A recorded run by ${who}.`;
+    await play(trace, keepStatus ? null : said);
   } catch (error) {
     status(`Couldn't load the recorded run (${error.message}).`);
   }

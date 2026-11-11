@@ -32,6 +32,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.headline and args.banner not in {"route", "draft"}:
         parser.error("--headline only works with route and draft")
+    # The clock's own day, which the daily workflow sets to Toronto's.
+    now = datetime.datetime.now()
+    day = f"{now.day} {now:%b %Y}"
 
     if args.banner in {"routes", "head"}:
         {"routes": routes, "head": head}[args.banner].export(ROOT / "build" / args.banner)
@@ -44,16 +47,15 @@ def main() -> None:
         routed = args.headline.with_name("route.json")
         if routed.exists():
             told = json.loads(routed.read_text(encoding="utf-8"))
-            title, link = told["runs"][0]["text"], told["headline"]["link"]
+            title, link, day = told["runs"][0]["text"], told["headline"]["link"], told["headline"]["day"]
         else:
             title, link = route.headline()
         t = draft.trace(draft.ask(title))
-        t["headline"] = {"title": title, "link": link}
+        # The page shows the day and links the story beside the run.
+        t["headline"] = {"title": title, "link": link, "day": day}
         save(args.headline, draft.render(t))
         args.headline.with_suffix(".json").write_text(json.dumps(t), encoding="utf-8")
     elif args.headline:
-        now = datetime.datetime.now(datetime.UTC)
-        day = f"{now.day} {now:%b %Y}"
         subtitle = (
             f"Today's top Hacker News headline ({day}), routed live through IBM Granite 3.0 1B-A400M. "
             "Each token goes to 8 of 32 experts in every one of 24 layers."

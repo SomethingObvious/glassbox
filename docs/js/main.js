@@ -5,11 +5,13 @@ import { initQuant } from "./quant.js";
 import { initRoute } from "./route.js";
 import { initWaves } from "./waves.js";
 
-// Pages sends the deploy time as Last-Modified, so the running head dates itself.
+// Pages sends the deploy time as Last-Modified, so the running head dates itself, with the day it was in Toronto.
 const issued = new Date(document.lastModified);
 if (!Number.isNaN(issued.getTime())) {
-  $("issued").textContent = issued.toLocaleDateString("en-CA", { month: "long", year: "numeric" });
-  $("issued").dateTime = issued.toISOString().slice(0, 7);
+  const toronto = { timeZone: "America/Toronto" };
+  $("issued").textContent = issued.toLocaleDateString("en-CA", { ...toronto, dateStyle: "long" });
+  // Canadian English writes a plain date year first with hyphens, which is the form the attribute takes.
+  $("issued").dateTime = issued.toLocaleDateString("en-CA", toronto);
 }
 
 initWaves();
