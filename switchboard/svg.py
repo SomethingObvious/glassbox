@@ -35,11 +35,20 @@ def text(
     weight: int = 400,
     font: str = SANS,
     cls: str = "",
+    fit: float = 0,
+    lead: str = "",
 ) -> str:
+    """With `fit`, the text is squeezed or stretched to exactly that many px, whatever monospace font the viewer has.
+
+    `lead` is a bold name in ink set before `s` on the same line, so no fallback font can push the two apart.
+    """
     c = f' class="{cls}"' if cls else ""
+    if fit:
+        c += f' textLength="{fit:.1f}" lengthAdjust="spacingAndGlyphs"'
+    name = f'<tspan font-weight="700"{paint(INK)}>{escape(lead)}</tspan>' if lead else ""
     return (
         f'<text x="{x:.1f}" y="{y:.1f}" font-family="{font}" font-size="{size}"{paint(fill)} '
-        f'text-anchor="{anchor}" font-weight="{weight}"{c}>{escape(s)}</text>'
+        f'text-anchor="{anchor}" font-weight="{weight}"{c}>{name}{escape(s)}</text>'
     )
 
 
@@ -77,19 +86,41 @@ class Timeline:
     def __init__(self, period: float) -> None:
         self.period = period
         self.rules: list[str] = []
+        self.ends: list[tuple[float, float, str]] = []
 
-    def show(self, name: str, on: float, off: float, lit: float = 1.0) -> str:
-        """Makes class `name` visible from second `on` to second `off` of every loop, and returns the name."""
+    def show(
+        self, name: str, on: float, off: float, lit: float = 1.0, fade: float = 0.0, out: float | None = None
+    ) -> str:
+        """Makes class `name` visible from second `on` to second `off` of every loop, and returns the name.
+
+        With `fade` it eases in over that many seconds after `on` and out over that many before `off`, and `out`
+        sets the ease out on its own.
+        """
         a, b = 100 * on / self.period, 100 * off / self.period
+        unit, half = 100 / self.period, (b - a) / 2
+        up, down = min(fade * unit, half), min((fade if out is None else out) * unit, half)
+        start, rise = (a, a + up) if up else (max(a - 0.01, 0), a)
+        fall = b - down if down else max(b - 0.01, a)
         self.rules.append(
-            f"@keyframes {name}{{0%,{max(a - 0.01, 0):.2f}%{{opacity:0}}{a:.2f}%,{max(b - 0.01, a):.2f}%"
+            f"@keyframes {name}{{0%,{start:.2f}%{{opacity:0}}{rise:.2f}%,{fall:.2f}%"
             f"{{opacity:{lit:g}}}{b:.2f}%,100%{{opacity:0}}}}"
             f".{name}{{animation:{name} {self.period}s linear infinite}}"
         )
+        self.ends.append((off, lit, name))
         return name
 
-    def css(self, base: str = "") -> str:
-        return "\n".join([base, *self.rules])
+    def css(self, base: str = "", still: bool = False) -> str:
+        """Every rule, after `base`. With `still`, reduced motion shows what the loop ends on instead of nothing."""
+        rules = [base, *self.rules]
+        if still:
+            last = max(off for off, _, _ in self.ends)
+            final = [(lit, name) for off, lit, name in self.ends if off == last]
+            shown = "".join(
+                ",".join(f".{name}" for at, name in final if at == lit) + f"{{opacity:{lit:g}}}"
+                for lit in sorted({lit for lit, _ in final})
+            )
+            rules.append(f"@media (prefers-reduced-motion:reduce){{{shown}}}")
+        return "\n".join(rules)
 
 
 def document(title: str, height: int, style: str, body: list[str]) -> str:

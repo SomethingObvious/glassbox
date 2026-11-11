@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from glassbox import draft, route, spell, waves
-from glassbox.svg import Timeline
+from switchboard import draft, quant, route, spell, waves
+from switchboard.svg import Timeline
 
 DATA = Path(__file__).resolve().parent.parent / "docs" / "data"
 
@@ -44,6 +44,18 @@ def test_timeline_keyframes_cover_the_whole_loop():
     assert "animation:a 10.0s linear infinite" in css
 
 
+def test_reduced_motion_shows_what_the_loop_ends_on():
+    tl = Timeline(10.0)
+    tl.show("gone", 1.0, 4.0)
+    tl.show("kept", 2.0, 9.0, lit=0.3, out=1.0)
+    tl.show("eased", 5.0, 9.0, fade=1.0)
+    css = tl.css(still=True)
+    assert "@keyframes kept{0%,19.99%{opacity:0}20.00%,80.00%{opacity:0.3}90.00%,100%{opacity:0}}" in css
+    assert "@keyframes eased{0%,50.00%{opacity:0}60.00%,80.00%{opacity:1}90.00%,100%{opacity:0}}" in css
+    # Only what is still showing when the loop ends stays up, each at its own strength.
+    assert css.endswith("@media (prefers-reduced-motion:reduce){.kept{opacity:0.3}.eased{opacity:1}}")
+
+
 @pytest.mark.parametrize("name", ["route", "draft"])
 def test_saved_traces_render(name):
     path = DATA / f"{name}.json"
@@ -67,9 +79,33 @@ def test_spell_puts_a_split_character_on_the_token_that_finishes_it():
     raw = rocket.encode()
     assert spell([b"Launch", b" " + raw[:2], raw[2:3], raw[3:]]) == ["Launch", r" \xF0\x9F", r"\x9A", rocket]
     assert spell(["café".encode(), b" ok"]) == ["café", " ok"]
-    assert spell([b"\xff", b"ok"]) == ["\N{REPLACEMENT CHARACTER}", "ok"]
+    assert spell([b"\xff", b"ok"]) == ["", "ok"]
+    # Half an emoji the model never finishes, then plain text.
+    assert spell([b" " + raw[:2], b" sky"]) == [r" \xF0\x9F", " sky"]
 
 
 def test_saved_traces_have_no_replacement_characters():
-    for name in ["route", "draft"]:
+    for name in ["route", "draft", "quant", "lens"]:
         assert "\N{REPLACEMENT CHARACTER}" not in (DATA / f"{name}.json").read_text(encoding="utf-8")
+
+
+def test_rounding_keeps_each_groups_ends_and_errs_by_half_a_step_at_most():
+    torch = pytest.importorskip("torch")
+    w = torch.linspace(-1, 1, 256).reshape(2, 128)
+    out = quant.rounded(w, quant.Format("int4", 4, 128))
+    assert [r.unique().numel() for r in out] == [16, 16]
+    for got, want in [(out.amin(-1), w.amin(-1)), (out.amax(-1), w.amax(-1))]:
+        assert torch.allclose(got, want, atol=1e-6)
+    assert (out - w).abs().max() <= (w[0].max() - w[0].min()) / 15 / 2 + 1e-6
+    assert torch.equal(quant.rounded(w, quant.FORMATS[0]), w)
+
+
+def test_lens_trace_has_every_layer_at_every_position_likeliest_first():
+    t = json.loads((DATA / "lens.json").read_text(encoding="utf-8"))
+    for run in t["runs"]:
+        assert len(run["layers"]) == 28
+        for layer in run["layers"]:
+            assert len(layer) == len(run["tokens"])
+            for top in layer:
+                probs = [p for _, p in top]
+                assert probs == sorted(probs, reverse=True) and sum(probs) <= 1.0001

@@ -1,5 +1,7 @@
 import { $ } from "./dom.js";
 import { initDraft } from "./draft.js";
+import { initLens } from "./lens.js";
+import { initQuant } from "./quant.js";
 import { initRoute } from "./route.js";
 import { initWaves } from "./waves.js";
 
@@ -11,5 +13,5 @@ if (!Number.isNaN(issued.getTime())) {
 }
 
 initWaves();
-await Promise.all([initDraft(), initRoute()]);
+await Promise.all([initDraft(), initRoute(), initQuant(), initLens()]);
 window.__done = true;

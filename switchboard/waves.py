@@ -40,7 +40,7 @@ class Plan:
 
 # Llama 3 8B's MLP up projection over 512 tokens, in BF16 on an H100 SXM.
 PLAN, K = Plan(m=512, n=14336, tile=128, sms=132), 4096
-PERIOD, START, STEP = 15.0, 1.2, 2.7
+PERIOD, START, STEP, FADE = 15.0, 1.2, 2.7, 0.5
 
 
 def render(p: Plan = PLAN) -> str:
@@ -56,16 +56,22 @@ def render(p: Plan = PLAN) -> str:
             SOFT,
         ),
     ]
+    # Everything eases in and out, since whole rows of light blocks blinking at once is hard on the eyes.
     running, done, label, bar = [], [], [], []
     for w in range(p.waves):
         on, off = START + w * STEP, START + (w + 1) * STEP
-        running.append(tl.show(f"a{w}", on, off - 0.25 if w < p.waves - 1 else end))
-        done.append(tl.show(f"c{w}", off - 0.25, end, lit=0.3))
-        label.append(tl.show(f"l{w}", on, off - 0.05 if w < p.waves - 1 else end))
-        bar.append(tl.show(f"b{w}", on, end))
-    idle = tl.show("idle", START + (p.waves - 1) * STEP, end)
+        final = w == p.waves - 1
+        running.append(tl.show(f"a{w}", on, end if final else off + FADE / 2, fade=FADE))
+        done.append(tl.show(f"c{w}", off - FADE / 2, end, lit=0.3, fade=FADE))
+        label.append(tl.show(f"l{w}", on, end if final else off, fade=0.3))
+        bar.append(tl.show(f"b{w}", on, end, fade=FADE))
+    last = START + (p.waves - 1) * STEP
+    # An SM stays lit for as long as it has tiles, so only the ones the last wave leaves out go dark.
+    working = tl.show("work", START, end, fade=2 * FADE)
+    resting = tl.show("rest", START, last + FADE / 2, fade=2 * FADE)
+    idle = tl.show("idle", last, end, fade=FADE)
 
-    # Output matrix C: each tile fills while its wave runs, then stays as a light wash once done.
+    # A tile stays as a light wash once its wave is done.
     x0, y0, cw = 60, 154, (W - 120) / p.cols
     body.append(text(x0, y0 - 12, f"output C, {p.rows} × {p.cols} tiles", 15, SOFT))
     for i in range(p.tiles):
@@ -77,7 +83,6 @@ def render(p: Plan = PLAN) -> str:
             rect(x, y, cw - 2, cw - 2, INK, running[w]),
         ]
 
-    # The SMs, 22 by 6, each showing the tile it runs in the current wave.
     gx, gy, per_row, gap = 60, 254, 22, 8
     side = (W - 120 - (per_row - 1) * gap) / per_row
     body.append(text(gx, gy - 12, f"{p.sms} streaming multiprocessors", 15, SOFT))
@@ -85,16 +90,14 @@ def render(p: Plan = PLAN) -> str:
         r, c = divmod(s, per_row)
         x, y = gx + c * (side + gap), gy + r * (side + gap)
         body.append(rect(x, y, side, side, stroke=FAINT))
+        body.append(rect(x, y, side, side, INK, working if s < p.busy(p.waves - 1) else resting))
         for w in range(p.waves):
             if s < p.busy(w):
-                body.append(
-                    f'<g class="{running[w]}">{rect(x, y, side, side, INK)}'
-                    f"{text(x + side / 2, y + side / 2 + 6, f't{w * p.sms + s}', 15, SHEET, 'middle', 700, MONO)}</g>"
-                )
+                tile = f"t{w * p.sms + s}"
+                body.append(text(x + side / 2, y + side / 2 + 6, tile, 15, SHEET, "middle", 700, MONO, label[w]))
         if s >= p.busy(p.waves - 1):
             body.append(rect(x + 2, y + 2, side - 4, side - 4, cls=idle, stroke=LOST, width=2, dash="6 5"))
 
-    # Wave counter, then one bar per wave filled to its share of busy SMs.
     ly = gy + math.ceil(p.sms / per_row) * (side + gap) + 34
     for w in range(p.waves):
         n = p.busy(w)
@@ -130,10 +133,10 @@ def render(p: Plan = PLAN) -> str:
             weight=700,
         )
     )
-    hidden = ",".join(f".{c}" for c in [*running, *done, *label, *bar, idle])
+    hidden = ",".join(f".{c}" for c in [*running, *done, *label, *bar, working, resting, idle])
     return document(
         "A matrix multiply's tiles going out to an H100's SMs in waves",
         int(fy + 40),
-        tl.css(hidden + "{opacity:0}"),
+        tl.css(hidden + "{opacity:0}", still=True),
         body,
     )

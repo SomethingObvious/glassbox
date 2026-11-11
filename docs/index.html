@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>glassbox</title>
-<meta name="description" content="Live, interactive figures of LLM inference: speculative decoding on your own GPU, mixture-of-experts routing and GPU waves.">
+<title>switchboard, live figures of LLM inference</title>
+<meta name="description" content="Five live figures of LLM inference, drawn from real runs of small public models. Speculative decoding raced on a clock, mixture-of-experts routing, GPU waves, weight rounding and the logit lens.">
 <meta name="color-scheme" content="light dark">
-<meta property="og:title" content="glassbox">
-<meta property="og:description" content="Speculative decoding, mixture-of-experts routing and GPU waves, drawn from real runs of small public models.">
-<meta property="og:image" content="https://somethingobvious.github.io/glassbox/og.png">
+<meta property="og:title" content="switchboard, live figures of LLM inference">
+<meta property="og:description" content="Speculative decoding raced on a clock, mixture-of-experts routing, GPU waves, weight rounding and the logit lens, drawn from real runs of small public models.">
+<meta property="og:image" content="https://somethingobvious.github.io/switchboard/og.png">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23fdfdfb'/%3E%3Crect x='5' y='9' width='10' height='14' fill='none' stroke='%23121212' stroke-width='2.5'/%3E%3Crect x='17' y='9' width='10' height='14' fill='none' stroke='%23c4161c' stroke-width='2.5' stroke-dasharray='3 2'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -19,8 +19,8 @@
 <body>
 <a class="skip" href="#figure-1">Skip to Figure 1</a>
 <header class="running">
-  <b>glassbox</b>
-  <nav aria-label="Figures"><a href="#figure-1">Figure 1</a><a href="#figure-2">Figure 2</a><a href="#figure-3">Figure 3</a></nav>
+  <b>switchboard</b>
+  <nav aria-label="Figures"><a href="#figure-1">Figure 1</a><a href="#figure-2">Figure 2</a><a href="#figure-3">Figure 3</a><a href="#figure-4">Figure 4</a><a href="#figure-5">Figure 5</a></nav>
   <span><time id="issued" datetime="2026-11">November 2026</time></span>
 </header>
 
@@ -30,46 +30,63 @@
     <h1>Inside LLM Inference, Drawn From Real Runs of Small Public Models</h1>
     <p class="author">Paul Wu, <a href="https://github.com/SomethingObvious">github.com/SomethingObvious</a></p>
     <h2 class="abstract-head">Abstract</h2>
-    <p class="abstract">A small model guesses the next four tokens and a big model checks all four in one forward pass. Guesses up to the first miss are kept, and the big model adds one token of its own. With greedy decoding the text is exactly what the big model writes alone. In the recorded run in Figure 1 that takes 16 big-model passes instead of 48. Figure 2 shows real router choices inside a mixture-of-experts model, and Figure 3 shows why a matrix multiply leaves part of a GPU idle.</p>
+    <p class="abstract">A one-layer EAGLE-3 head reads Qwen3-1.7B's own hidden states and guesses the next four tokens, and Qwen3-1.7B checks all four in one forward pass. Guesses up to the first miss are kept, and the big model adds one token of its own. With greedy decoding the text is exactly what the big model writes alone, just sooner. Every day Figure 1 explains the top Hacker News headline that way on GitHub's CPUs and races it against the big model writing alone, and the button below runs one on your GPU with one guess a pass. Figure 2 shows real router choices inside a mixture-of-experts model, Figure 3 shows why a matrix multiply leaves part of a GPU idle, Figure 4 shows what rounding the weights to fewer bits costs, and Figure 5 reads the answer out of every layer as it forms.</p>
     <div class="action">
       <button id="d-run" class="go">Run Figure 1 on This GPU</button>
-      <span class="cost">Downloads 1.6 GB once, then your browser caches it</span>
+      <span class="cost">Downloads 1.5 GB once, then your browser caches it</span>
     </div>
   </div>
 
   <figure id="figure-1" class="fig">
     <div class="sheet">
       <div class="models" aria-hidden="true">
-        <span><b>Qwen3-0.6B</b> guesses</span>
+        <span><b>EAGLE-3 head</b> guesses</span>
         <span><b>Qwen3-1.7B</b> checks in one pass</span>
       </div>
-      <div class="out" id="d-out" aria-live="polite" aria-label="Generated text, coloured by what happened to each token"></div>
+      <div class="out" id="d-out" role="log" aria-label="Generated text, coloured by what happened to each token"></div>
+      <div class="race" id="race">
+        <div class="alone" id="race-alone-box" aria-hidden="true">
+          <p class="models"><span><b>Qwen3-1.7B</b> alone, on the same clock</span></p>
+          <p class="lane-text" id="race-alone-t"></p>
+        </div>
+        <div class="lane"><span><b>Qwen3-1.7B</b> with guesses</span><output id="race-spec-n"></output><div class="bar"><i id="race-spec"></i></div></div>
+        <div class="lane"><span><b>Qwen3-1.7B</b> alone</span><output id="race-alone-n"></output><div class="bar"><i id="race-alone"></i></div></div>
+        <p class="race-note" id="race-note"></p>
+      </div>
       <ol class="callouts">
-        <li><i class="k guess"></i><b>102</b> guessed by the small model</li>
+        <li><i class="k guess"></i><b>102</b> guessed, not yet checked</li>
         <li><i class="k kept"></i><b>104</b> kept by the big model</li>
         <li><i class="k miss"></i><b>106</b> first miss, thrown away</li>
         <li><i class="k own"></i><b>108</b> the big model's own token</li>
       </ol>
     </div>
-    <figcaption><b>Figure 1.</b> Speculative decoding. <span id="d-status">Qwen3-1.7B checking Qwen3-0.6B, four guesses a pass.</span></figcaption>
+    <figcaption><b>Figure 1.</b> Speculative decoding. <span id="d-status">Qwen3-1.7B checking its EAGLE-3 head, four guesses a pass.</span></figcaption>
     <div class="bar" aria-hidden="true"><i id="d-bar"></i></div>
     <dl class="readout">
       <div><dt>tokens written</dt><dd id="s-tok">0</dd></div>
       <div><dt>big-model passes</dt><dd id="s-pass">0</dd></div>
       <div><dt>tokens per pass</dt><dd id="s-per">0.00</dd></div>
       <div><dt>tokens a second</dt><dd id="s-rate">0</dd></div>
+      <div id="s-fast-cell"><dt>times as fast as alone</dt><dd id="s-fast">0.00</dd></div>
       <div class="hist-cell"><dt>how often guess n is kept</dt><dd class="hist" id="s-hist"></dd></div>
     </dl>
     <details class="controls">
-      <summary>Change the Prompt or the Guesses</summary>
+      <summary>Change the Prompt</summary>
       <div class="row">
-        <label class="f grow">Prompt<textarea id="d-prompt">In three sentences, explain why the sky is blue.</textarea></label>
+        <label class="f grow">Prompt<textarea id="d-prompt">In three sentences, explain how a compiler turns code into a program.</textarea></label>
       </div>
+      <div class="chips" id="d-tries" role="group" aria-label="Prompts to run on this GPU">
+        <button class="chip" data-prompt="Repeat this sentence five times: The quick brown fox jumps over the lazy dog.">Repeat a Sentence</button>
+        <button class="chip" data-prompt="List the twelve months of the year with the number of days in each.">List the Months</button>
+        <button class="chip" data-prompt="Write an HTML page with a heading and a list of three fruits.">Write an HTML Page</button>
+        <button class="chip" data-prompt="Write a Python function that checks whether a number is prime.">Write a Python Function</button>
+        <button class="chip" data-prompt="In three sentences, explain how a compiler turns code into a program.">Explain a Compiler</button>
+        <button class="chip" data-prompt="Translate into French: The weather is nice today, so we are going to walk to the market and buy some bread.">Translate Into French</button>
+      </div>
+      <p class="cost">Each of these runs on this GPU. How much the guesses help depends on how easy the answer is to guess. On an RTX 4070 laptop GPU the repeated sentence and the months are written at about 125 tokens a second, about 1.5 times as fast as alone, the HTML page 1.4, the Python function 1.3 and the compiler answer 1.2, and the translation comes out slower, at about 0.9.</p>
       <div class="row">
-        <label class="f" for="d-depth"><span>Guesses per pass <output id="d-depth-v">4</output></span><input id="d-depth" type="range" min="1" max="8" value="4"></label>
         <label class="f">New tokens<input id="d-max" type="number" min="16" max="256" value="96"></label>
         <button id="d-replay">Replay the Recorded Run</button>
-        <button id="d-check" disabled>Check Against the Big Model Alone</button>
       </div>
     </details>
   </figure>
@@ -83,10 +100,15 @@
     <p class="side-note" id="r-woke"></p>
   </div>
   <figure id="figure-2" class="fig">
+    <form class="row" id="r-form">
+      <label class="f grow">Route your own sentence<input id="r-text" type="text" maxlength="200" autocomplete="off"></label>
+      <button id="r-go" class="go">Route It on This GPU</button>
+    </form>
+    <p class="cost" id="r-status">Downloads 1.5 GB once, then your browser keeps it. The 8-bit copy picks the same 8 experts as the full model at 94.8% of token and layer pairs.</p>
     <div class="chips" id="r-runs" role="group" aria-label="Sentence"></div>
     <div class="toks" id="r-toks"></div>
     <div class="split">
-      <svg class="grid" id="r-grid" role="img" aria-label="Router choices, layers down and experts across"></svg>
+      <svg class="grid" id="r-grid" role="group" tabindex="0" aria-label="Router choices, layers down and experts across. Arrow keys move between layers and experts."></svg>
       <div class="side">
         <p class="cur"><span class="big" id="r-cur"></span></p>
         <p id="r-share"></p>
@@ -132,8 +154,69 @@
   </figure>
 </section>
 
+<section class="part" id="quant" aria-labelledby="quant-head">
+  <div class="text">
+    <h2 id="quant-head">Rounding Weights to Fewer Bits</h2>
+    <p>Qwen3-0.6B ships its weights in bf16, and every token it writes reads all of them from memory. Storing them in 8 or 4 bits makes each token cheaper, and the price is rounding. Figure 4 snaps one real row of weights to a grid, then shows what each format does to the text the whole model writes.</p>
+    <p class="side-note">A group of weights shares one grid, stretched from its smallest weight to its largest. One outlier stretches the grid for its whole group, so the rest fall onto a few levels near zero. Smaller groups keep that damage local, at the cost of more scales to store.</p>
+  </div>
+  <figure id="figure-4" class="fig">
+    <div class="row controls-row">
+      <label class="f grow">Row<select id="q-row"></select></label>
+      <label class="f">Format<select id="q-format"><option>int8</option><option>fp8 e4m3</option><option selected>int4</option><option>int3</option><option>int2</option></select></label>
+      <label class="f">Group<select id="q-group"><option value="32">32 weights</option><option value="64">64 weights</option><option value="128" selected>128 weights</option><option value="row">Whole row</option></select></label>
+    </div>
+    <canvas id="q-plot" height="320" role="img" aria-label="One row's weights before and after rounding"></canvas>
+    <dl class="readout">
+      <div><dt>bits a weight, scales included</dt><dd id="q-bits"></dd></div>
+      <div><dt>levels used in the biggest weight's group</dt><dd id="q-used"></dd></div>
+      <div><dt>rounding error across the row</dt><dd id="q-err"></dd></div>
+    </dl>
+    <div class="table-wrap">
+      <table class="runs">
+        <thead><tr><th scope="col">Whole model in</th><th scope="col">Bits a weight</th><th scope="col">Picks bf16's next token</th><th scope="col">KL from bf16, nats</th><th scope="col">Tokens before it splits</th></tr></thead>
+        <tbody id="q-runs"></tbody>
+      </table>
+    </div>
+    <p class="q-say" id="q-say"></p>
+    <div class="out q-out" id="q-text" aria-live="polite"></div>
+    <ol class="callouts">
+      <li><i class="k dot"></i><b>402</b> a weight as stored in bf16</li>
+      <li><i class="k tick"></i><b>404</b> the same weight after rounding</li>
+      <li><i class="k err"></i><b>406</b> what rounding lost</li>
+      <li><i class="k level"></i><b>408</b> the grid its group rounds to</li>
+      <li><i class="k miss"></i><b>410</b> the first token that differs from bf16</li>
+    </ol>
+    <figcaption><b>Figure 4.</b> One row of Qwen3-0.6B's weights rounded in your browser (top), and the whole model rounded the same way on a CPU, writing Figure 1's prompt (bottom).</figcaption>
+  </figure>
+</section>
+
+<section class="part" id="lens" aria-labelledby="lens-head">
+  <div class="text">
+    <h2 id="lens-head">Watching the Answer Form</h2>
+    <p>A model only commits to a token at its last layer, but every layer's output can be read the same way, through the final norm and the output head. Figure 5 does that for each of Qwen3-0.6B's 28 layers at every position of a prompt. This is the logit lens. Hover or tap a cell to see its five likeliest tokens.</p>
+    <p class="side-note" id="l-settle"></p>
+    <p class="side-note">For the French prompt, the layers just before the end guess 犬, the Chinese and Japanese word for dog, before the last layer settles on "ch" for chien. Studies of other multilingual models have seen the same thing, with the middle layers working in the language they saw most in training.</p>
+  </div>
+  <figure id="figure-5" class="fig">
+    <div class="chips" id="l-runs" role="group" aria-label="Prompt"></div>
+    <div class="split lens-split">
+      <div class="lens-wrap"><div class="lens" id="l-grid" role="group" tabindex="0" aria-label="Each layer's top guess for the next token, layers down and prompt tokens across. Arrow keys move between cells."></div></div>
+      <div class="side" aria-live="polite">
+        <p id="l-where"></p>
+        <ol class="l-top" id="l-top"></ol>
+      </div>
+    </div>
+    <ol class="callouts">
+      <li><i class="k pick"></i><b>502</b> that layer's top guess for the next token, darker when it is surer</li>
+      <li><i class="k ring-box"></i><b>504</b> the cell shown on the right</li>
+    </ol>
+    <figcaption><b>Figure 5.</b> The logit lens on Qwen3-0.6B, layers down and prompt tokens across. The bottom row is what the model actually predicts.</figcaption>
+  </figure>
+</section>
+
 <footer>
-  <p>Source, traces and the README banners are on <a href="https://github.com/SomethingObvious/glassbox">GitHub</a>. Every number on this page comes from a real run or a public spec.</p>
+  <p>Source, traces and the README banners are on <a href="https://github.com/SomethingObvious/switchboard">GitHub</a>. Every number on this page comes from a real run or a public spec.</p>
 </footer>
 </main>
 <div class="tip" id="tip" role="status"></div>

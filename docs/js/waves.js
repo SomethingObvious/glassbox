@@ -1,6 +1,5 @@
 import { $, calm, canvas, onScheme, sleep, tone } from "./dom.js";
 
-// Public SM counts.
 const GPUS = [
   ["H100 SXM", 132],
   ["H100 PCIe", 114],
@@ -11,7 +10,8 @@ const GPUS = [
   ["RTX 4090", 128],
   ["RTX 5090", 170],
 ];
-const state = { wave: -1, playing: false };
+// `mix` runs from 0 to 1 as wave `from` fades into `wave`, and -1 stands for the last wave.
+const state = { wave: -1, from: -1, mix: 1, playing: false };
 
 /** Tiles, waves and efficiency for an M x N output split into tm x tn tiles on `sms` SMs. */
 export function plan(m, n, tm, tn, sms) {
@@ -31,32 +31,52 @@ function drawSms(p) {
   const gap = 5;
   let cols = Math.ceil(Math.sqrt(p.sms * (width / gridHeight)));
   while (cols > 2 && Math.ceil(p.sms / (cols - 1)) * (width / (cols - 1)) <= gridHeight) cols--;
-  const rows = Math.ceil(p.sms / cols);
-  const side = Math.min((width - 24 - (cols - 1) * gap) / cols, (gridHeight - 12 - (rows - 1) * gap) / rows);
+  const fit = (c) => {
+    const rows = Math.ceil(p.sms / c);
+    return Math.min((width - 24 - (c - 1) * gap) / c, (gridHeight - 12 - (rows - 1) * gap) / rows);
+  };
+  // A column count that divides the SMs evenly fills the last row, so take the roomiest one unless it costs much size.
+  const even = Array.from({ length: p.sms - 2 }, (_, i) => i + 2)
+    .filter((c) => p.sms % c === 0)
+    .sort((a, b) => fit(b) - fit(a))[0];
+  if (even && fit(even) >= 0.8 * fit(cols)) cols = even;
+  const side = fit(cols);
   const left = (width - cols * side - (cols - 1) * gap) / 2;
+  const rows = Math.ceil(p.sms / cols);
+  const top = (gridHeight + 12 - rows * side - (rows - 1) * gap) / 2;
   const [ink, sheet, lost, sans] = [tone("ink"), tone("sheet"), tone("lost"), tone("sans")];
-  const wave = state.wave < 0 ? p.waves - 1 : state.wave;
-  const busy = Math.min(p.sms, p.tiles - wave * p.sms);
+  const at = (w) => (w < 0 ? p.waves - 1 : w);
+  const busyIn = (w) => Math.min(p.sms, p.tiles - w * p.sms);
+  const wave = at(state.wave);
+  const busy = busyIn(wave);
+  // Each wave fades into the next, since a third of the grid going from black to empty in one frame is hard on the eyes.
+  const sides = [
+    [at(state.from), 1 - state.mix],
+    [wave, state.mix],
+  ];
+  ctx.font = `700 ${Math.min(13, side / 3.4)}px ${sans}`;
+  ctx.textAlign = "center";
   for (let i = 0; i < p.sms; i++) {
     const x = left + (i % cols) * (side + gap);
-    const y = 12 + Math.floor(i / cols) * (side + gap);
-    if (i >= busy) {
-      ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = lost;
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(x + 0.75, y + 0.75, side - 1.5, side - 1.5);
-      ctx.setLineDash([]);
-    } else {
-      ctx.fillStyle = ink;
-      ctx.fillRect(x, y, side, side);
-    }
-    if (i < busy && side > 30) {
-      ctx.fillStyle = sheet;
-      ctx.font = `700 ${Math.min(13, side / 3.4)}px ${sans}`;
-      ctx.textAlign = "center";
-      ctx.fillText(`t${wave * p.sms + i}`, x + side / 2, y + side / 2 + 4);
+    const y = top + Math.floor(i / cols) * (side + gap);
+    const full = sides.reduce((sum, [w, share]) => sum + (i < busyIn(w) ? share : 0), 0);
+    ctx.globalAlpha = 1 - full;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = lost;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x + 0.75, y + 0.75, side - 1.5, side - 1.5);
+    ctx.setLineDash([]);
+    ctx.globalAlpha = full;
+    ctx.fillStyle = ink;
+    ctx.fillRect(x, y, side, side);
+    ctx.fillStyle = sheet;
+    for (const [w, share] of sides) {
+      if (i >= busyIn(w) || side <= 30) continue;
+      ctx.globalAlpha = share;
+      ctx.fillText(`t${w * p.sms + i}`, x + side / 2, y + side / 2 + 4);
     }
   }
+  ctx.globalAlpha = 1;
   ctx.fillStyle = busy < p.sms ? lost : ink;
   ctx.font = `700 15px ${sans}`;
   ctx.textAlign = "left";
@@ -121,13 +141,21 @@ async function play() {
   state.playing = true;
   $("w-play").disabled = true;
   const p = current();
+  const hold = calm ? 200 : Math.max(250, 3200 / p.waves);
+  const fade = calm ? 0 : Math.min(500, 0.6 * hold);
   for (let w = 0; w < p.waves && state.playing; w++) {
-    state.wave = w;
-    drawSms(p);
-    await sleep(calm ? 200 : Math.max(250, 2400 / p.waves));
+    [state.from, state.wave] = [state.wave, w];
+    const started = performance.now();
+    do {
+      state.mix = fade ? Math.min(1, (performance.now() - started) / fade) : 1;
+      drawSms(p);
+      await new Promise(requestAnimationFrame);
+    } while (state.mix < 1 && state.playing);
+    await sleep(hold - fade);
   }
   state.playing = false;
   state.wave = -1;
+  state.mix = 1;
   $("w-play").disabled = false;
   drawSms(current());
 }
@@ -138,10 +166,22 @@ export function initWaves() {
     $(id).addEventListener("input", () => {
       state.playing = false;
       state.wave = -1;
+      state.mix = 1;
       update();
     });
   }
   $("w-play").addEventListener("click", play);
+  if (!calm) {
+    const watcher = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry.isIntersecting) return;
+        watcher.disconnect();
+        play();
+      },
+      { threshold: 0.6 },
+    );
+    watcher.observe($("w-sms"));
+  }
   new ResizeObserver(update).observe($("w-sms"));
   onScheme(update);
   // Canvas text needs the web fonts, so draw again once they land.

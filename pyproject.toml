@@ -1,5 +1,5 @@
 [project]
-name = "glassbox"
+name = "switchboard"
 version = "1.0.0"
 description = "Animated pictures of LLM inference, drawn from real runs of small public models"
 readme = "README.md"
@@ -10,9 +10,10 @@ dependencies = []
 
 [project.optional-dependencies]
 trace = ["torch>=2.6", "transformers>=5.0"]
+export = ["switchboard[trace]", "onnx>=1.20", "onnxruntime>=1.25", "onnxscript>=0.5"]
 
 [project.scripts]
-glassbox = "glassbox.__main__:main"
+switchboard = "switchboard.__main__:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff==0.17.1"]

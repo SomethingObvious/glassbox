@@ -1,0 +1,824 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
+index 3b94812..1356025 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
+@@ -35,6 +35,9 @@ namespace {
+ 
+ constexpr uint32_t kFusedDecodeFastPathBits = 4u;
+ constexpr uint32_t kFusedDecodeFastPathBlockSize = 32u;
++// The decode shader keeps every row's tile of A and partial sums in workgroup memory, and 4 rows
++// of f16 come to about 13 KB of the 16 KB WebGPU guarantees.
++constexpr uint32_t kFusedDecodeMaxRows = 4u;
+ 
+ // Emits the WGSL expression that applies the gate activation. The result must use
+ // the variable names produced by the inline kernel (`gate_value`) and the shader
+@@ -63,7 +66,8 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+                               uint32_t tile_size_k_vec,
+                               uint32_t k_unroll_tiles,
+                               MlpActivationKind activation_kind,
+-                              bool acc_f32)
++                              bool acc_f32,
++                              uint32_t rows)
+       : Program{"MatMulNBitsMlpDecode"},
+         tile_size_(tile_size),
+         has_gate_bias_(has_gate_bias),
+@@ -75,7 +79,8 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+         tile_size_k_vec_(tile_size_k_vec),
+         k_unroll_tiles_(k_unroll_tiles),
+         activation_kind_(activation_kind),
+-        acc_f32_(acc_f32) {}
++        acc_f32_(acc_f32),
++        rows_(rows) {}
+ 
+   Status GenerateShaderCode(ShaderHelper& shader) const override {
+     const auto& a = shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
+@@ -122,6 +127,7 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+                                WGSL_TEMPLATE_PARAMETER(has_skip_output, has_skip_output_),
+                                WGSL_TEMPLATE_PARAMETER(has_up_bias, has_up_bias_),
+                                WGSL_TEMPLATE_PARAMETER(k_unroll_tiles, k_unroll_tiles_),
++                               WGSL_TEMPLATE_PARAMETER(rows, rows_),
+                                WGSL_TEMPLATE_PARAMETER(single_scale_weights, single_scale_weights_),
+                                WGSL_TEMPLATE_PARAMETER(sub_tile_count, sub_tile_count),
+                                WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
+@@ -162,6 +168,7 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+   uint32_t k_unroll_tiles_;
+   MlpActivationKind activation_kind_;
+   bool acc_f32_;
++  uint32_t rows_;
+ };
+ 
+ class MatMulNBitsMlpProgram final : public Program<MatMulNBitsMlpProgram> {
+@@ -293,8 +300,9 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+   const bool has_skip_input = skip != nullptr;
+   const bool has_skip_output = input_skip_bias_sum != nullptr;
+ 
++  const bool acc_f32 = context.EnableMatmulFp32Accumulation();
+   const bool is_decode_fast_path_candidate =
+-      M == 1 &&
++      M <= (acc_f32 ? kFusedDecodeMaxRows - 1u : kFusedDecodeMaxRows) &&
+       bits_ == kFusedDecodeFastPathBits &&
+       block_size == kFusedDecodeFastPathBlockSize;
+   const bool has_norm_input = norm_scale != nullptr;
+@@ -314,20 +322,11 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+   const bool would_use_dp4a_unfused =
+       CanApplyDP4AMatrixMatMulNBits(context, accuracy_level_, block_size, N, K, components_a,
+                                     M, /*has_weight_idx_indirect=*/false, y);
+-  const bool would_use_wide_tile_unfused =
+-      CanApplyWideTileMatMulNBits(M,
+-                                  K,
+-                                  block_size,
+-                                  bits_,
+-                                  /*has_weight_idx_indirect=*/false,
+-                                  components_a,
+-                                  components_b);
+-
++  // The wide tile program is the prefill kernel, and it pads these few rows out to a 32-row tile.
+   const bool can_use_decode_fast_path =
+       is_decode_fast_path_candidate &&
+       !would_use_subgroup_unfused &&
+-      !would_use_dp4a_unfused &&
+-      !would_use_wide_tile_unfused;
++      !would_use_dp4a_unfused;
+ 
+   if (can_use_decode_fast_path) {
+     ORT_ENFORCE(bits_ == kFusedDecodeFastPathBits,
+@@ -410,7 +409,6 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+     }
+ 
+     const uint32_t num_N_tile = CeilDiv(N, tile_size);
+-    const bool acc_f32 = context.EnableMatmulFp32Accumulation();
+ 
+     MatMulNBitsMlpDecodeProgram program{tile_size,
+                                         has_gate_bias,
+@@ -422,7 +420,8 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+                                         tile_size_k_vec,
+                                         k_unroll_tiles,
+                                         activation_kind_,
+-                                        acc_f32};
++                                        acc_f32,
++                                        M};
+     program.SetWorkgroupSize(workgroup_size);
+     program.SetDispatchGroupSize(num_N_tile, 1, batch_count);
+     program.AddInput({decode_a, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_a)});
+@@ -458,6 +457,7 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+                    k_unroll_tiles,
+                    static_cast<uint32_t>(activation_kind_),
+                    acc_f32,
++                   M,
+                    "decode_4bit");
+     if (decode_has_skip_output) {
+       program.AddOutput({input_skip_bias_sum,
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template
+index 4e8fa1a..472d497 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template
+@@ -17,6 +17,9 @@
+ #param has_gate_bias
+ #param has_up_bias
+ #param k_unroll_tiles
++// Rows of A that one workgroup takes through the weights together. Each weight word is
++// loaded and unpacked once and then applied to every row, so a few rows cost one read.
++#param rows
+ // Gate activation applied between gate and up projections.
+ // Mirrors MlpActivationKind in matmul_nbits_mlp.h:
+ //   0 = SiLU (only value currently supported)
+@@ -29,7 +32,7 @@
+ #if has_norm_input
+ var<workgroup> sum_squared_shared : array<f32, workgroup_size_x>;
+ #endif
+-var<workgroup> tile_A : array<input_a_value_t, a_length_per_tile>;
++var<workgroup> tile_A : array<input_a_value_t, a_length_per_tile * rows>;
+ // Precision of the dot products and of the partial sums accumulated along K, selected by the
+ // "enableMatmulFp32Accumulation" provider option. It is off by default, which leaves this
+ // shader identical to what it was before the option existed; turning it on keeps the
+@@ -39,8 +42,8 @@ alias acc_element_t = f32;
+ #else
+ alias acc_element_t = output_element_t;
+ #endif
+-var<workgroup> gate_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size>;
+-var<workgroup> up_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size>;
++var<workgroup> gate_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size * rows>;
++var<workgroup> up_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size * rows>;
+ 
+ const default_zero_point = output_element_t(8);
+ 
+@@ -53,10 +56,10 @@ fn load_merged_input(input_offset: u32) -> input_a_value_t {
+ #endif
+ }
+ 
+-fn loadSHMA(batch: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32)
++fn loadSHMA(batch: u32, row: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32)
+ {
+     let k_offset = kidx / component_a + col;
+-    let input_offset = batch * uniforms.K_of_a + k_offset;
++    let input_offset = (batch * rows + row) * uniforms.K_of_a + k_offset;
+   if (k_offset < uniforms.K_of_a) {
+         let merged_value = load_merged_input(input_offset);
+ #if has_skip_output
+@@ -65,16 +68,17 @@ fn loadSHMA(batch: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32)
+         }
+ #endif
+ #if has_norm_input
+-        tile_A[col] = merged_value * input_a_value_t(input_a_element_t(inv_std)) * norm_scale.getByOffset(k_offset);
++        tile_A[row * a_length_per_tile + col] = merged_value * input_a_value_t(input_a_element_t(inv_std)) * norm_scale.getByOffset(k_offset);
+ #else
+-        tile_A[col] = merged_value;
++        tile_A[row * a_length_per_tile + col] = merged_value;
+ #endif
+     } else {
+-        tile_A[col] = input_a_value_t(0);
++        tile_A[row * a_length_per_tile + col] = input_a_value_t(0);
+     }
+ }
+ 
+-fn compute_gate_up_sums(b_global: u32, kidx: u32, idx: u32, k_offset: u32) -> vec2<acc_element_t> {
++// Adds this thread's share of one k tile to the gate and up sums of output column `b_global`, for every row.
++fn add_gate_up_sums(b_global: u32, kidx: u32, idx: u32, k_offset: u32, slot: u32) {
+ #if single_scale_weights
+   let gate_scale_b = gate_scales_b.getByOffset(0);
+   let up_scale_b = up_scales_b.getByOffset(0);
+@@ -86,8 +90,8 @@ fn compute_gate_up_sums(b_global: u32, kidx: u32, idx: u32, k_offset: u32) -> ve
+   let gate_b_value = gate_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
+   let up_b_value = up_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
+ 
+-  var gate_sum = acc_element_t(0);
+-  var up_sum = acc_element_t(0);
++  var gate_sum : array<acc_element_t, rows>;
++  var up_sum : array<acc_element_t, rows>;
+   var a_offset = idx * (8 / component_a) * component_b;
+ #if component_b == 1
+   let gate_b_value_lower = vec4<output_element_t>(unpack4xU8(gate_b_value & 0x0F0F0F0Fu)) - vec4<output_element_t>(default_zero_point);
+@@ -98,22 +102,21 @@ fn compute_gate_up_sums(b_global: u32, kidx: u32, idx: u32, k_offset: u32) -> ve
+   let up_b_value_upper = vec4<output_element_t>(unpack4xU8((up_b_value >> 4) & 0x0F0F0F0Fu)) - vec4<output_element_t>(default_zero_point);
+   let up_b0 = vec4<output_element_t>(up_b_value_lower[0], up_b_value_upper[0], up_b_value_lower[1], up_b_value_upper[1]) * up_scale_b;
+   let up_b1 = vec4<output_element_t>(up_b_value_lower[2], up_b_value_upper[2], up_b_value_lower[3], up_b_value_upper[3]) * up_scale_b;
++  for (var r = 0u; r < rows; r++) {
++    let at = r * a_length_per_tile + a_offset;
+ #if component_a == 1
+-  let a0 = vec4<output_element_t>(tile_A[a_offset], tile_A[a_offset + 1], tile_A[a_offset + 2], tile_A[a_offset + 3]);
+-  let a1 = vec4<output_element_t>(tile_A[a_offset + 4], tile_A[a_offset + 5], tile_A[a_offset + 6], tile_A[a_offset + 7]);
+-  gate_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
+-  up_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
++    let a0 = vec4<output_element_t>(tile_A[at], tile_A[at + 1], tile_A[at + 2], tile_A[at + 3]);
++    let a1 = vec4<output_element_t>(tile_A[at + 4], tile_A[at + 5], tile_A[at + 6], tile_A[at + 7]);
+ #elif component_a == 2
+-  let a0 = vec4<output_element_t>(tile_A[a_offset], tile_A[a_offset + 1]);
+-  let a1 = vec4<output_element_t>(tile_A[a_offset + 2], tile_A[a_offset + 3]);
+-  gate_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
+-  up_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
++    let a0 = vec4<output_element_t>(tile_A[at], tile_A[at + 1]);
++    let a1 = vec4<output_element_t>(tile_A[at + 2], tile_A[at + 3]);
+ #elif component_a == 4
+-  let a0 = tile_A[a_offset];
+-  let a1 = tile_A[a_offset + 1];
+-  gate_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
+-  up_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
++    let a0 = tile_A[at];
++    let a1 = tile_A[at + 1];
+ #endif
++    gate_sum[r] += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
++    up_sum[r] += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
++  }
+ #else
+   for (var i = 0u; i < component_b; i++) {
+       let gate_b_value_lower = vec4<output_element_t>(unpack4xU8(gate_b_value[i] & 0x0F0F0F0Fu)) - vec4<output_element_t>(default_zero_point);
+@@ -124,35 +127,37 @@ fn compute_gate_up_sums(b_global: u32, kidx: u32, idx: u32, k_offset: u32) -> ve
+       let up_b_value_upper = vec4<output_element_t>(unpack4xU8((up_b_value[i] >> 4) & 0x0F0F0F0Fu)) - vec4<output_element_t>(default_zero_point);
+       let up_b0 = vec4<output_element_t>(up_b_value_lower[0], up_b_value_upper[0], up_b_value_lower[1], up_b_value_upper[1]) * up_scale_b;
+       let up_b1 = vec4<output_element_t>(up_b_value_lower[2], up_b_value_upper[2], up_b_value_lower[3], up_b_value_upper[3]) * up_scale_b;
++      for (var r = 0u; r < rows; r++) {
++        let at = r * a_length_per_tile + a_offset;
+ #if component_a == 1
+-      let a0 = vec4<output_element_t>(tile_A[a_offset], tile_A[a_offset + 1], tile_A[a_offset + 2], tile_A[a_offset + 3]);
+-      let a1 = vec4<output_element_t>(tile_A[a_offset + 4], tile_A[a_offset + 5], tile_A[a_offset + 6], tile_A[a_offset + 7]);
+-      gate_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
+-      up_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
+-      a_offset += 8;
++        let a0 = vec4<output_element_t>(tile_A[at], tile_A[at + 1], tile_A[at + 2], tile_A[at + 3]);
++        let a1 = vec4<output_element_t>(tile_A[at + 4], tile_A[at + 5], tile_A[at + 6], tile_A[at + 7]);
+ #elif component_a == 2
+-      let a0 = vec4<output_element_t>(tile_A[a_offset], tile_A[a_offset + 1]);
+-      let a1 = vec4<output_element_t>(tile_A[a_offset + 2], tile_A[a_offset + 3]);
+-      gate_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
+-      up_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
+-      a_offset += 4;
++        let a0 = vec4<output_element_t>(tile_A[at], tile_A[at + 1]);
++        let a1 = vec4<output_element_t>(tile_A[at + 2], tile_A[at + 3]);
+ #elif component_a == 4
+-      let a0 = tile_A[a_offset];
+-      let a1 = tile_A[a_offset + 1];
+-      gate_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
+-      up_sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
+-      a_offset += 2;
++        let a0 = tile_A[at];
++        let a1 = tile_A[at + 1];
+ #endif
++        gate_sum[r] += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(gate_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(gate_b1));
++        up_sum[r] += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(up_b0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(up_b1));
++      }
++      a_offset += 8 / component_a;
+   }
+ #endif
+ 
+-  return vec2<acc_element_t>(gate_sum, up_sum);
++  for (var r = 0u; r < rows; r++) {
++    gate_inter_results[r * tile_size + slot][idx] += gate_sum[r];
++    up_inter_results[r * tile_size + slot][idx] += up_sum[r];
++  }
+ }
+ 
+-fn process_k_tile(batch: u32, b_global_base: u32, thread_idx: u32, idx: u32, idy: u32, kidx: u32, inv_std: f32) {
+-  for (var id = thread_idx; id < a_length_per_tile; id += workgroup_size_x)
+-  {
+-    loadSHMA(batch, b_global_base, kidx, id, inv_std);
++fn process_k_tile(batch: u32, b_global_base: u32, thread_idx: u32, idx: u32, idy: u32, kidx: u32, inv_std: array<f32, rows>) {
++  for (var r = 0u; r < rows; r++) {
++    for (var id = thread_idx; id < a_length_per_tile; id += workgroup_size_x)
++    {
++      loadSHMA(batch, r, b_global_base, kidx, id, inv_std[r]);
++    }
+   }
+   workgroupBarrier();
+ 
+@@ -161,9 +166,7 @@ fn process_k_tile(batch: u32, b_global_base: u32, thread_idx: u32, idx: u32, idy
+     let b_global = b_global_base + local_row_offset + idy;
+     let k_offset = kidx / elements_in_value_b + idx;
+     if (b_global < uniforms.N && k_offset < uniforms.K_of_b) {
+-      let sums = compute_gate_up_sums(b_global, kidx, idx, k_offset);
+-      gate_inter_results[local_row_offset + idy][idx] += sums[0];
+-      up_inter_results[local_row_offset + idy][idx] += sums[1];
++      add_gate_up_sums(b_global, kidx, idx, k_offset, local_row_offset + idy);
+     }
+   }
+   workgroupBarrier();
+@@ -177,43 +180,52 @@ $MAIN {
+   let idy = local_idx / tile_size_k_vec;
+ 
+   if (local_idx < tile_size) {
+-    for (var b = 0u; b < tile_size_k_vec; b++) {
+-      gate_inter_results[local_idx][b] = acc_element_t(0);
+-      up_inter_results[local_idx][b] = acc_element_t(0);
++    for (var r = 0u; r < rows; r++) {
++      for (var b = 0u; b < tile_size_k_vec; b++) {
++        gate_inter_results[r * tile_size + local_idx][b] = acc_element_t(0);
++        up_inter_results[r * tile_size + local_idx][b] = acc_element_t(0);
++      }
+     }
+   }
+   workgroupBarrier();
+ 
++  var inv_std : array<f32, rows>;
+ #if has_norm_input
+-  var sum_squared_local = 0.0;
+-  for (var a_idx = local_idx; a_idx < uniforms.K_of_a; a_idx += workgroup_size_x) {
+-    let a_value = load_merged_input(batch * uniforms.K_of_a + a_idx);
++  for (var r = 0u; r < rows; r++) {
++    var sum_squared_local = 0.0;
++    for (var a_idx = local_idx; a_idx < uniforms.K_of_a; a_idx += workgroup_size_x) {
++      let a_value = load_merged_input((batch * rows + r) * uniforms.K_of_a + a_idx);
+ #if component_a == 1
+-    let a_f32 = f32(a_value);
+-    sum_squared_local += a_f32 * a_f32;
++      let a_f32 = f32(a_value);
++      sum_squared_local += a_f32 * a_f32;
+ #elif component_a == 2
+-    let a_f32 = vec2<f32>(a_value);
+-    sum_squared_local += dot(a_f32, a_f32);
++      let a_f32 = vec2<f32>(a_value);
++      sum_squared_local += dot(a_f32, a_f32);
+ #elif component_a == 4
+-    let a_f32 = vec4<f32>(a_value);
+-    sum_squared_local += dot(a_f32, a_f32);
++      let a_f32 = vec4<f32>(a_value);
++      sum_squared_local += dot(a_f32, a_f32);
+ #endif
+-  }
+-  sum_squared_shared[local_idx] = sum_squared_local;
+-  workgroupBarrier();
++    }
++    sum_squared_shared[local_idx] = sum_squared_local;
++    workgroupBarrier();
+ 
+-  var reduce_size : u32 = workgroup_size_x;
+-  for (var curr_size = reduce_size >> 1; curr_size > 0; curr_size = reduce_size >> 1) {
+-    reduce_size = curr_size + (reduce_size & 1u);
+-    if (local_idx < curr_size) {
+-      sum_squared_shared[local_idx] += sum_squared_shared[local_idx + reduce_size];
++    var reduce_size : u32 = workgroup_size_x;
++    for (var curr_size = reduce_size >> 1; curr_size > 0; curr_size = reduce_size >> 1) {
++      reduce_size = curr_size + (reduce_size & 1u);
++      if (local_idx < curr_size) {
++        sum_squared_shared[local_idx] += sum_squared_shared[local_idx + reduce_size];
++      }
++      workgroupBarrier();
+     }
++
++    inv_std[r] = inverseSqrt(sum_squared_shared[0] / f32(uniforms.K) + uniforms.epsilon);
++    // Every thread has to read the total before the next row's sums overwrite it.
+     workgroupBarrier();
+   }
+-
+-  let inv_std = inverseSqrt(sum_squared_shared[0] / f32(uniforms.K) + uniforms.epsilon);
+ #else
+-  let inv_std = 1.0;
++  for (var r = 0u; r < rows; r++) {
++    inv_std[r] = 1.0;
++  }
+ #endif
+ 
+ #if k_unroll_tiles == 1
+@@ -249,29 +261,31 @@ $MAIN {
+   }
+ 
+   if (local_idx < tile_size) {
+-    var gate_output_value = acc_element_t(0);
+-    var up_output_value = acc_element_t(0);
+-    for (var b = 0u; b < tile_size_k_vec; b++) {
+-      gate_output_value += gate_inter_results[local_idx][b];
+-      up_output_value += up_inter_results[local_idx][b];
+-    }
+     let b_global = b_global_base + local_idx;
+-    let output_idx = batch * uniforms.N + b_global;
+     if (b_global < uniforms.N) {
++      for (var r = 0u; r < rows; r++) {
++        var gate_output_value = acc_element_t(0);
++        var up_output_value = acc_element_t(0);
++        for (var b = 0u; b < tile_size_k_vec; b++) {
++          gate_output_value += gate_inter_results[r * tile_size + local_idx][b];
++          up_output_value += up_inter_results[r * tile_size + local_idx][b];
++        }
++        let output_idx = (batch * rows + r) * uniforms.N + b_global;
+ #if has_gate_bias
+-      gate_output_value += acc_element_t(gate_bias[b_global]);
++        gate_output_value += acc_element_t(gate_bias[b_global]);
+ #endif
+ #if has_up_bias
+-      up_output_value += acc_element_t(up_bias[b_global]);
++        up_output_value += acc_element_t(up_bias[b_global]);
+ #endif
+-      let one = acc_element_t(1.0);
++        let one = acc_element_t(1.0);
+ #if activation_kind == 0
+-      // SiLU(x) = x * sigmoid(x). New activations are added with additional
+-      // `#elif activation_kind == N` blocks (must match MlpActivationKind).
+-      let activated_value = gate_output_value * (one / (one + exp(-gate_output_value)));
++        // SiLU(x) = x * sigmoid(x). New activations are added with additional
++        // `#elif activation_kind == N` blocks (must match MlpActivationKind).
++        let activated_value = gate_output_value * (one / (one + exp(-gate_output_value)));
+ #endif
+-      // Downcast to the output element type only at the final store.
+-      output.setByOffset(output_idx, output_element_t(activated_value * up_output_value));
++        // Downcast to the output element type only at the final store.
++        output.setByOffset(output_idx, output_element_t(activated_value * up_output_value));
++      }
+     }
+   }
+ }  // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
+index 7137b6a..28be9d8 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
+@@ -33,7 +33,8 @@ class MatMulNBitsQkvDecodeProgram final
+                               bool has_norm,
+                               bool has_skip_input,
+                               bool has_skip_output,
+-                              bool acc_f32)
++                              bool acc_f32,
++                              uint32_t rows)
+       : Program{"MatMulNBitsQkvDecode"},
+         tile_size_(tile_size),
+         single_scale_weights_(single_scale_weights),
+@@ -42,7 +43,8 @@ class MatMulNBitsQkvDecodeProgram final
+         has_norm_(has_norm),
+         has_skip_input_(has_skip_input),
+         has_skip_output_(has_skip_output),
+-        acc_f32_(acc_f32) {
++        acc_f32_(acc_f32),
++        rows_(rows) {
+     // The no-norm variant runs against an already-normalized input tensor and therefore
+     // never owns the residual skip path nor the residual passthrough output.
+     ORT_ENFORCE(has_norm_ || (!has_skip_input_ && !has_skip_output_),
+@@ -87,6 +89,7 @@ class MatMulNBitsQkvDecodeProgram final
+                                WGSL_TEMPLATE_PARAMETER(has_skip_input, has_skip_input_),
+                                WGSL_TEMPLATE_PARAMETER(has_skip_output, has_skip_output_),
+                                WGSL_TEMPLATE_PARAMETER(k_unroll_tiles, k_unroll_tiles_),
++                               WGSL_TEMPLATE_PARAMETER(rows, rows_),
+                                WGSL_TEMPLATE_PARAMETER(single_scale_weights, single_scale_weights_),
+                                WGSL_TEMPLATE_PARAMETER(sub_tile_count, sub_tile_count),
+                                WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
+@@ -129,6 +132,7 @@ class MatMulNBitsQkvDecodeProgram final
+   bool has_skip_input_;
+   bool has_skip_output_;
+   bool acc_f32_;
++  uint32_t rows_;
+ };
+ 
+ }  // namespace
+@@ -206,13 +210,11 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+       !would_use_subgroup_unfused &&
+       CanApplyDP4AMatrixMatMulNBits(context, accuracy_level_, block_size, Nq, K, GetMaxComponents(K),
+                                     M, /*has_weight_idx_indirect=*/false, q_output);
+-  const bool would_use_wide_tile_unfused =
+-      !would_use_subgroup_unfused &&
+-      !would_use_dp4a_unfused &&
+-      CanApplyWideTileMatMulNBits(M,
+-                                  K,
+-                                  block_size,
+-                                  bits_);
++  // The decode shader keeps every row's tile of A and partial sums in workgroup memory, and 4 rows
++  // of f16 come to about 15 KB of the 16 KB WebGPU guarantees. The wide tile program is the prefill
++  // kernel, and it would pad these few rows out to a 32-row tile.
++  const bool acc_f32 = context.EnableMatmulFp32Accumulation();
++  const uint32_t max_decode_rows = acc_f32 ? 3u : 4u;
+ 
+   // The fused MatMulNBitsQkv shader binds every Q/K/V weight + scales tensor and the
+   // norm/skip tensors as storage buffers. Devices with a tight maxStorageBuffersPerShaderStage
+@@ -233,8 +235,7 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+   const bool exceeds_storage_buffer_limit =
+       required_storage_buffers > context.DeviceLimits().maxStorageBuffersPerShaderStage;
+ 
+-  if (would_use_subgroup_unfused || would_use_dp4a_unfused || would_use_wide_tile_unfused ||
+-      M != 1) {
++  if (would_use_subgroup_unfused || would_use_dp4a_unfused || M > max_decode_rows) {
+     Tensor normalized_a = context.CreateGPUTensor(a->DataType(), a->Shape());
+ 
+     if (skip != nullptr) {
+@@ -325,7 +326,6 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+   }
+ 
+   const uint32_t num_N_tile = CeilDiv(std::max(Nq, Nkv), tile_size);
+-  const bool acc_f32 = context.EnableMatmulFp32Accumulation();
+   MatMulNBitsQkvDecodeProgram program{tile_size,
+                                       single_scale_weights,
+                                       tile_size_k_vec,
+@@ -333,7 +333,8 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+                                       decode_has_norm,
+                                       decode_has_skip_input,
+                                       decode_has_skip_output,
+-                                      acc_f32};
++                                      acc_f32,
++                                      M};
+   program.SetWorkgroupSize(workgroup_size);
+   program.SetDispatchGroupSize(num_N_tile, 1, batch_count);
+   program
+@@ -376,6 +377,7 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+                  decode_has_skip_input,
+                  decode_has_skip_output,
+                  acc_f32,
++                 M,
+                  "decode_qkv_sln");
+   if (decode_has_skip_output) {
+     program.AddOutput({decode_input_skip_bias_sum,
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template
+index a668259..ff65c85 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template
+@@ -9,6 +9,9 @@
+ #param has_skip_input
+ #param has_skip_output
+ #param k_unroll_tiles
++// Rows of A that one workgroup takes through the weights together. Each weight word is
++// loaded and unpacked once and then applied to every row, so a few rows cost one read.
++#param rows
+ #param single_scale_weights
+ #param sub_tile_count
+ #param tile_size_k_vec
+@@ -21,7 +24,7 @@
+ #if has_norm
+ var<workgroup> sum_squared_shared : array<f32, workgroup_size_x>;
+ #endif
+-var<workgroup> tile_A : array<input_a_value_t, a_length_per_tile>;
++var<workgroup> tile_A : array<input_a_value_t, a_length_per_tile * rows>;
+ // Precision of the dot products and of the partial sums accumulated along K, selected by the
+ // "enableMatmulFp32Accumulation" provider option. It is off by default, which leaves this
+ // shader identical to what it was before the option existed; turning it on keeps the
+@@ -34,9 +37,9 @@ alias acc_element_t = f32;
+ // TypeConstraint T1 in the op schema), so any of them works as the f16 alias target.
+ alias acc_element_t = q_output_element_t;
+ #endif
+-var<workgroup> q_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size>;
+-var<workgroup> k_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size>;
+-var<workgroup> v_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size>;
++var<workgroup> q_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size * rows>;
++var<workgroup> k_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size * rows>;
++var<workgroup> v_inter_results : array<array<acc_element_t, tile_size_k_vec + 1>, tile_size * rows>;
+ 
+ const default_zero_point = vec4<q_output_element_t>(q_output_element_t(8));
+ 
+@@ -83,9 +86,9 @@ fn load_a_vec4(a_offset: u32) -> vec4<q_output_element_t> {
+ }
+ #endif
+ 
+-fn loadSHMA(batch: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32) {
++fn loadSHMA(batch: u32, row: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32) {
+   let k_offset = kidx / component_a + col;
+-  let input_offset = batch * uniforms.K_of_a + k_offset;
++  let input_offset = (batch * rows + row) * uniforms.K_of_a + k_offset;
+   if (k_offset < uniforms.K_of_a) {
+ #if has_norm
+     let merged_value = load_merged_input(input_offset);
+@@ -94,71 +97,58 @@ fn loadSHMA(batch: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32) {
+       input_skip_bias_sum.setByOffset(input_offset, input_skip_bias_sum_value_t(merged_value));
+     }
+ #endif
+-    tile_A[col] = merged_value * input_a_value_t(input_a_element_t(inv_std)) * norm_scale.getByOffset(k_offset);
++    tile_A[row * a_length_per_tile + col] = merged_value * input_a_value_t(input_a_element_t(inv_std)) * norm_scale.getByOffset(k_offset);
+ #else
+     // Layer norm has already been applied to `a` upstream; load the pre-normalized value directly.
+     _ = b_global_base;
+     _ = inv_std;
+-    tile_A[col] = a.getByOffset(input_offset);
++    tile_A[row * a_length_per_tile + col] = a.getByOffset(input_offset);
+ #endif
+   } else {
+-    tile_A[col] = input_a_value_t(0);
++    tile_A[row * a_length_per_tile + col] = input_a_value_t(0);
+   }
+ }
+ 
+-fn compute_projection_sum(weight: q_b_value_t,
+-                          scale: q_output_element_t,
+-                          idx: u32) -> acc_element_t {
+-  var sum = acc_element_t(0);
++// This thread's share of one k tile for one output column of one projection, as a sum per row.
++fn compute_projection_sums(weight: q_b_value_t,
++                           scale: q_output_element_t,
++                           idx: u32) -> array<acc_element_t, rows> {
++  var sum : array<acc_element_t, rows>;
+   var a_offset = idx * (8 / component_a) * component_b;
+ #if component_b == 1
+   let weight_lower = unpack_nibble_values(weight & 0x0F0F0F0Fu) - default_zero_point;
+   let weight_upper = unpack_nibble_values((weight >> 4) & 0x0F0F0F0Fu) - default_zero_point;
+   let w0 = vec4<q_output_element_t>(q_output_element_t(weight_lower[0]), q_output_element_t(weight_upper[0]), q_output_element_t(weight_lower[1]), q_output_element_t(weight_upper[1])) * scale;
+   let w1 = vec4<q_output_element_t>(q_output_element_t(weight_lower[2]), q_output_element_t(weight_upper[2]), q_output_element_t(weight_lower[3]), q_output_element_t(weight_upper[3])) * scale;
+-#if component_a == 1
+-  let a0 = load_a_vec4(a_offset);
+-  let a1 = load_a_vec4(a_offset + 4);
+-  sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
+-#elif component_a == 2
+-  let a0 = load_a_vec4(a_offset);
+-  let a1 = load_a_vec4(a_offset + 2);
+-  sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
+-#elif component_a == 4
+-  let a0 = load_a_vec4(a_offset);
+-  let a1 = load_a_vec4(a_offset + 1);
+-  sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
+-#endif
++  for (var r = 0u; r < rows; r++) {
++    let at = r * a_length_per_tile + a_offset;
++    let a0 = load_a_vec4(at);
++    let a1 = load_a_vec4(at + 4 / component_a);
++    sum[r] += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
++  }
+ #else
+   for (var i = 0u; i < component_b; i++) {
+     let weight_lower = unpack_nibble_values(weight[i] & 0x0F0F0F0Fu) - default_zero_point;
+     let weight_upper = unpack_nibble_values((weight[i] >> 4) & 0x0F0F0F0Fu) - default_zero_point;
+     let w0 = vec4<q_output_element_t>(q_output_element_t(weight_lower[0]), q_output_element_t(weight_upper[0]), q_output_element_t(weight_lower[1]), q_output_element_t(weight_upper[1])) * scale;
+     let w1 = vec4<q_output_element_t>(q_output_element_t(weight_lower[2]), q_output_element_t(weight_upper[2]), q_output_element_t(weight_lower[3]), q_output_element_t(weight_upper[3])) * scale;
+-#if component_a == 1
+-  let a0 = load_a_vec4(a_offset);
+-  let a1 = load_a_vec4(a_offset + 4);
+-    sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
+-    a_offset += 8;
+-#elif component_a == 2
+-  let a0 = load_a_vec4(a_offset);
+-  let a1 = load_a_vec4(a_offset + 2);
+-    sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
+-    a_offset += 4;
+-#elif component_a == 4
+-  let a0 = load_a_vec4(a_offset);
+-  let a1 = load_a_vec4(a_offset + 1);
+-    sum += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
+-    a_offset += 2;
+-#endif
++    for (var r = 0u; r < rows; r++) {
++      let at = r * a_length_per_tile + a_offset;
++      let a0 = load_a_vec4(at);
++      let a1 = load_a_vec4(at + 4 / component_a);
++      sum[r] += dot(vec4<acc_element_t>(a0), vec4<acc_element_t>(w0)) + dot(vec4<acc_element_t>(a1), vec4<acc_element_t>(w1));
++    }
++    a_offset += 8 / component_a;
+   }
+ #endif
+   return sum;
+ }
+ 
+-fn process_k_tile(batch: u32, b_global_base: u32, thread_idx: u32, idx: u32, idy: u32, kidx: u32, inv_std: f32) {
+-  for (var id = thread_idx; id < a_length_per_tile; id += workgroup_size_x) {
+-      loadSHMA(batch, b_global_base, kidx, id, inv_std);
++fn process_k_tile(batch: u32, b_global_base: u32, thread_idx: u32, idx: u32, idy: u32, kidx: u32, inv_std: array<f32, rows>) {
++  for (var r = 0u; r < rows; r++) {
++    for (var id = thread_idx; id < a_length_per_tile; id += workgroup_size_x) {
++        loadSHMA(batch, r, b_global_base, kidx, id, inv_std[r]);
++    }
+   }
+   workgroupBarrier();
+ 
+@@ -170,6 +160,7 @@ fn process_k_tile(batch: u32, b_global_base: u32, thread_idx: u32, idx: u32, idy
+ 
+   for (var local_row_offset = 0u; local_row_offset < tile_size; local_row_offset += sub_tile_count) {
+     let b_global = b_global_base + local_row_offset + idy;
++    let slot = local_row_offset + idy;
+     let k_offset = kidx / elements_in_value_b + idx;
+   #if !single_scale_weights
+     let block_idx = (kidx + idx * elements_in_value_b) / uniforms.block_size;
+@@ -179,23 +170,30 @@ fn process_k_tile(batch: u32, b_global_base: u32, thread_idx: u32, idx: u32, idy
+   #if !single_scale_weights
+         let q_scale_b = q_output_element_t(q_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
+   #endif
+-      let q_weight = q_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
+-      q_inter_results[local_row_offset + idy][idx] += compute_projection_sum(q_weight, q_scale_b, idx);
+-    }
+-    if (b_global < uniforms.Nkv) {
++        let q_weight = q_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
++        let q_sums = compute_projection_sums(q_weight, q_scale_b, idx);
++        for (var r = 0u; r < rows; r++) {
++          q_inter_results[r * tile_size + slot][idx] += q_sums[r];
++        }
++      }
++      if (b_global < uniforms.Nkv) {
+   #if !single_scale_weights
+-      let k_scale_b = q_output_element_t(k_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
+-      let v_scale_b = q_output_element_t(v_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
++        let k_scale_b = q_output_element_t(k_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
++        let v_scale_b = q_output_element_t(v_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
+   #endif
+-      let k_weight = k_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
+-      let v_weight = v_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
+-      k_inter_results[local_row_offset + idy][idx] += compute_projection_sum(k_weight, k_scale_b, idx);
+-      v_inter_results[local_row_offset + idy][idx] += compute_projection_sum(v_weight, v_scale_b, idx);
+-    }
++        let k_weight = k_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
++        let v_weight = v_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
++        let k_sums = compute_projection_sums(k_weight, k_scale_b, idx);
++        let v_sums = compute_projection_sums(v_weight, v_scale_b, idx);
++        for (var r = 0u; r < rows; r++) {
++          k_inter_results[r * tile_size + slot][idx] += k_sums[r];
++          v_inter_results[r * tile_size + slot][idx] += v_sums[r];
++        }
++      }
+     }
+   }
+   workgroupBarrier();
+-  }
++}
+ 
+ $MAIN {
+   let batch = workgroup_idx / uniforms.num_N_tile;
+@@ -205,44 +203,53 @@ $MAIN {
+   let idy = local_idx / tile_size_k_vec;
+ 
+   if (local_idx < tile_size) {
+-    for (var b = 0u; b < tile_size_k_vec; b++) {
+-      q_inter_results[local_idx][b] = acc_element_t(0);
+-      k_inter_results[local_idx][b] = acc_element_t(0);
+-      v_inter_results[local_idx][b] = acc_element_t(0);
++    for (var r = 0u; r < rows; r++) {
++      for (var b = 0u; b < tile_size_k_vec; b++) {
++        q_inter_results[r * tile_size + local_idx][b] = acc_element_t(0);
++        k_inter_results[r * tile_size + local_idx][b] = acc_element_t(0);
++        v_inter_results[r * tile_size + local_idx][b] = acc_element_t(0);
++      }
+     }
+   }
+ 
++  var inv_std : array<f32, rows>;
+ #if has_norm
+-  var sum_squared_local = 0.0;
+-  for (var a_idx = local_idx; a_idx < uniforms.K_of_a; a_idx += workgroup_size_x) {
+-    let a_value = load_merged_input(batch * uniforms.K_of_a + a_idx);
++  for (var r = 0u; r < rows; r++) {
++    var sum_squared_local = 0.0;
++    for (var a_idx = local_idx; a_idx < uniforms.K_of_a; a_idx += workgroup_size_x) {
++      let a_value = load_merged_input((batch * rows + r) * uniforms.K_of_a + a_idx);
+ #if component_a == 1
+-    let a_f32 = f32(a_value);
+-    sum_squared_local += a_f32 * a_f32;
++      let a_f32 = f32(a_value);
++      sum_squared_local += a_f32 * a_f32;
+ #elif component_a == 2
+-    let a_f32 = vec2<f32>(a_value);
+-    sum_squared_local += dot(a_f32, a_f32);
++      let a_f32 = vec2<f32>(a_value);
++      sum_squared_local += dot(a_f32, a_f32);
+ #elif component_a == 4
+-    let a_f32 = vec4<f32>(a_value);
+-    sum_squared_local += dot(a_f32, a_f32);
++      let a_f32 = vec4<f32>(a_value);
++      sum_squared_local += dot(a_f32, a_f32);
+ #endif
+-  }
+-  sum_squared_shared[local_idx] = sum_squared_local;
+-  workgroupBarrier();
++    }
++    sum_squared_shared[local_idx] = sum_squared_local;
++    workgroupBarrier();
+ 
+-  var reduce_size : u32 = workgroup_size_x;
+-  for (var curr_size = reduce_size >> 1; curr_size > 0; curr_size = reduce_size >> 1) {
+-    reduce_size = curr_size + (reduce_size & 1u);
+-    if (local_idx < curr_size) {
+-      sum_squared_shared[local_idx] += sum_squared_shared[local_idx + reduce_size];
++    var reduce_size : u32 = workgroup_size_x;
++    for (var curr_size = reduce_size >> 1; curr_size > 0; curr_size = reduce_size >> 1) {
++      reduce_size = curr_size + (reduce_size & 1u);
++      if (local_idx < curr_size) {
++        sum_squared_shared[local_idx] += sum_squared_shared[local_idx + reduce_size];
++      }
++      workgroupBarrier();
+     }
++
++    inv_std[r] = inverseSqrt(sum_squared_shared[0] / f32(uniforms.K) + uniforms.epsilon);
++    // Every thread has to read the total before the next row's sums overwrite it.
+     workgroupBarrier();
+   }
+-
+-  let inv_std = inverseSqrt(sum_squared_shared[0] / f32(uniforms.K) + uniforms.epsilon);
+ #else
+   // Layer norm already applied upstream; inv_std is unused but kept in the loadSHMA signature.
+-  let inv_std = 1.0;
++  for (var r = 0u; r < rows; r++) {
++    inv_std[r] = 1.0;
++  }
+ #endif
+ 
+ #if k_unroll_tiles == 1
+@@ -275,20 +282,23 @@ $MAIN {
+ 
+   if (local_idx < tile_size) {
+     let b_global = b_global_base + local_idx;
+-    var q_output_value = acc_element_t(0);
+-    var k_output_value = acc_element_t(0);
+-    var v_output_value = acc_element_t(0);
+-    for (var b = 0u; b < tile_size_k_vec; b++) {
+-      q_output_value += q_inter_results[local_idx][b];
+-      k_output_value += k_inter_results[local_idx][b];
+-      v_output_value += v_inter_results[local_idx][b];
+-    }
+-    if (b_global < uniforms.Nq) {
+-      q_output.setByOffset(batch * uniforms.Nq + b_global, q_output_value_t(q_output_value));
+-    }
+-    if (b_global < uniforms.Nkv) {
+-      k_output.setByOffset(batch * uniforms.Nkv + b_global, k_output_value_t(k_output_value));
+-      v_output.setByOffset(batch * uniforms.Nkv + b_global, v_output_value_t(v_output_value));
++    for (var r = 0u; r < rows; r++) {
++      var q_output_value = acc_element_t(0);
++      var k_output_value = acc_element_t(0);
++      var v_output_value = acc_element_t(0);
++      for (var b = 0u; b < tile_size_k_vec; b++) {
++        q_output_value += q_inter_results[r * tile_size + local_idx][b];
++        k_output_value += k_inter_results[r * tile_size + local_idx][b];
++        v_output_value += v_inter_results[r * tile_size + local_idx][b];
++      }
++      let row = batch * rows + r;
++      if (b_global < uniforms.Nq) {
++        q_output.setByOffset(row * uniforms.Nq + b_global, q_output_value_t(q_output_value));
++      }
++      if (b_global < uniforms.Nkv) {
++        k_output.setByOffset(row * uniforms.Nkv + b_global, k_output_value_t(k_output_value));
++        v_output.setByOffset(row * uniforms.Nkv + b_global, v_output_value_t(v_output_value));
++      }
+     }
+   }
+ }

@@ -43,7 +43,8 @@ def spell(raw: Sequence[bytes]) -> list[str]:
         cut = _whole(buf)
         carry = buf[cut:]
         part = carry[-len(piece) :] if piece else b""
-        out.append(buf[:cut].decode(errors="replace") + "".join(f"\\x{b:02X}" for b in part))
+        # A model can start a character and never finish it, and those stray bytes have nothing to draw.
+        out.append(buf[:cut].decode(errors="ignore") + "".join(f"\\x{b:02X}" for b in part))
     return out
 
 

@@ -7,7 +7,6 @@ export const onScheme = (redraw) => matchMedia("(prefers-color-scheme: dark)").a
 
 const SVG = "http://www.w3.org/2000/svg";
 
-/** Creates an SVG element with attributes and appends it to `parent`. */
 export function svg(name, attrs, parent) {
   const node = document.createElementNS(SVG, name);
   for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);

@@ -18,7 +18,7 @@ SENTENCES = (
     "Once upon a time, a small robot learned to paint the sea at night.",
     "Launch day! 🚀 Our app hit 10,000 users in 24 hours 🎉",
 )
-SLOT = 0.85  # seconds each token stays lit
+SLOT, FADE = 0.85, 0.2  # seconds each token stays lit, and seconds it takes to hand over to the next
 
 
 class Layer(TypedDict):
@@ -83,7 +83,11 @@ def render(t: Trace, subtitle: str = "") -> str:
     run, n, k = t["runs"][0], t["experts"], t["k"]
     tokens, layers = run["tokens"], run["layers"]
     tl = Timeline(SLOT * len(tokens) + 1.5)
-    lit = [tl.show(f"t{i}", 0.6 + i * SLOT, 0.6 + (i + 1) * SLOT) for i in range(len(tokens))]
+    # Neighbouring tokens overlap by the fade, so one set of experts dims as the next lights.
+    lit = [
+        tl.show(f"t{i}", 0.6 + i * SLOT - FADE / 2, 0.6 + (i + 1) * SLOT + FADE / 2, fade=FADE)
+        for i in range(len(tokens))
+    ]
     subtitle = subtitle or (
         f"IBM Granite 3.0 1B-A400M has {n} experts in each of its {len(layers)} layers, and its router sends every "
         f"token to {k} of them. This is a real forward pass over one sentence."
@@ -93,7 +97,6 @@ def render(t: Trace, subtitle: str = "") -> str:
         text(60, 106, subtitle, 19, SOFT),
     ]
 
-    # The sentence as tokens, each filled in ink while it is the one being routed.
     x, y = 60.0, 164.0
     for i, s in enumerate(tokens):
         shown = s.replace(" ", "·") if s.strip() else "·"
@@ -108,7 +111,7 @@ def render(t: Trace, subtitle: str = "") -> str:
         ]
         x += w + 6
 
-    # Layers down, experts across. The faint wash is the sentence's total router weight per expert.
+    # The faint wash is the sentence's total router weight per expert.
     gx, gy, cw, ch = 110, y + 70, 34.0, 19.0
     body += [text(gx + e * cw, gy - 14, str(e), 14, SOFT) for e in range(0, n, 8)]
     body.append(text(gx + n * cw - 3, gy - 14, str(n - 1), 14, SOFT, "end"))
@@ -133,7 +136,6 @@ def render(t: Trace, subtitle: str = "") -> str:
                 strength = f' fill-opacity="{0.45 + 0.55 * min(1, wt * 3):.2f}"'
                 body.append(rect(gx + e * cw, y, cw - 3, ch - 3, INK, cls=lit[ti], extra=strength))
 
-    # The key, then two numbers measured from this trace.
     sx = gx + n * cw + 50
     for j, (swatch, numeral, label, more) in enumerate(
         [

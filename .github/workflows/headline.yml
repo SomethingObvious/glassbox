@@ -12,6 +12,7 @@ permissions:
 jobs:
   route:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,19 +21,20 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: granite-3.0-1b-a400m-instruct
+          key: granite-3.0-1b-a400m-instruct-qwen3-1.7b-eagle3-efcba5e
       - run: |
           pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
           pip install transformers==5.12.1
-      - run: python -m glassbox route --headline live/route.svg
+      - run: python -m switchboard route --headline live/route.svg
+      - run: python -m switchboard draft --headline live/draft.svg
       # The banner goes to its own branch so main keeps a readable history.
       - run: |
           cd live
           git init -q -b live
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add route.svg route.json
-          git commit -q -m "Routed today's headline"
+          git add route.svg route.json draft.svg draft.json
+          git commit -q -m "Ran today's headline"
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" live
       # GitHub turns off a public repo's schedules after 60 days without activity.
       # Re-enabling the workflow resets that clock without a commit.
