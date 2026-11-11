@@ -5,12 +5,13 @@ from recorded GPU commands. That needs fixed shapes and every input on the GPU, 
 the two numbers attention reads from it, and the KV cache is one fixed buffer per layer that a pass writes its new
 rows into. A guess the big model turns down needs no cleanup, as the next pass writes over its row.
 
-The big graph writes alone, one token a pass. The pass graph checks one guess and runs the EAGLE-3 head right after
+The big graph writes alone, one token a pass. The pass graph checks two guesses and runs the EAGLE-3 head right after
 the big model on what it read, so it guesses after every row in the same call. It also works out which rows the
 next pass reads, as the page starts that pass before the picks of this one are back on the CPU.
 """
 
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,7 +30,7 @@ BIG = {
 }
 LAYERS = (2, 14, 25)  # the same hidden states eagle.py reads
 DRAFT = Path(__file__).resolve().parent.parent / "docs" / "data" / "draft.json"
-ROWS = 2  # the pass graph's rows: the last token and one guess
+ROWS = 3  # the pass graph's rows: the last token and two guesses
 ENTRIES = 1024  # the length of the CPU check's cache buffers
 BLOCK = 16  # both vocabularies divide by it, and under 32 WebGPU gives the first step a thread for every block
 
@@ -268,44 +269,92 @@ def chained(model: "onnx.ModelProto") -> None:
     """Gives the pass graph `joined` made the next pass's inputs as outputs, each named `then_` and the input.
 
     The page copies them across on the GPU, so the next pass can start while this one's picks are still on their
-    way back. The guess was kept if it is the big model's pick after the last token. The next pass then reads the
-    pick and the guess after the guess, one row further on, and otherwise the two after the last token.
+    way back. A guess is kept if it is the big model's pick after the row before it and every guess before it was
+    kept. The next pass starts one row past the last kept guess, with the pick after that row, the head's guess
+    after the pick, and one more guess for each further row, which the head makes here from its own output.
     """
+    import copy
+
     import numpy as np
     from onnx import TensorProto, helper, numpy_helper
 
     g = model.graph
-    g.initializer.extend(
-        [
-            numpy_helper.from_array(np.array([0], np.int64), "then/first"),
-            numpy_helper.from_array(np.array([1], np.int64), "then/second"),
-            numpy_helper.from_array(np.array([1, ROWS], np.int64), "then/row"),
-        ]
-    )
+    held = {i.name for i in g.initializer}
+    steps = [n for n in g.node if n.name.startswith("head/")]
+    fc = next(n for n in steps if "states" in n.input)
+    own = next(n for n in steps if "head/norm" in n.input).input[0]  # the head's output, before its last norm
+    cache = [1, 8, "head_entries", 128]
 
-    def node(kind: str, inputs: list[str], out: str, **attrs: object) -> "onnx.NodeProto":
-        return helper.make_node(kind, inputs, [out], name=out, **attrs)
+    def const(name: str, value: "np.ndarray") -> str:
+        g.initializer.append(numpy_helper.from_array(value, f"then/{name}"))
+        return f"then/{name}"
 
-    g.node.extend(
-        [
-            node("Gather", ["input_ids", "then/second"], "then/guess", axis=1),
-            node("Gather", ["wants", "then/first"], "then/want", axis=1),
-            node("Equal", ["then/guess", "then/want"], "then/kept"),
-            node("Cast", ["then/kept"], "then/k", to=TensorProto.INT64),
-            # Column 0 holds the pick and the guess after the last token, and column 1 those after the guess. They
-            # go through floats, which hold a token id exactly, as WebGPU's Concat returns other memory for int64.
-            node("Cast", ["guesses"], "then/guesses", to=TensorProto.FLOAT),
-            node("Concat", ["wants/first", "then/guesses"], "then/both", axis=0),
-            node("Gather", ["then/both", "then/k"], "then/column", axis=1),
-            node("Reshape", ["then/column", "then/row"], "then/ids"),
-            node("Cast", ["then/ids"], "then_input_ids", to=TensorProto.INT64),
-            node("Add", ["then/k", "then/second"], "then/step"),
-            node("Add", ["position_ids", "then/step"], "then_position_ids"),
-            node("Cast", ["then/step"], "then/step32", to=TensorProto.INT32),
-            node("Add", ["seqlens", "then/step32"], "then_seqlens"),
-            node("Add", ["total", "then/step32"], "then_total"),
-        ]
-    )
+    def node(kind: str, inputs: list[str], out: str, **attrs: object) -> str:
+        g.node.append(helper.make_node(kind, inputs, [out], name=out, **attrs))
+        return out
+
+    at = [const(f"at{j}", np.array([j], np.int64)) for j in range(ROWS)]
+    flat, scalar = const("flat", np.array([1], np.int64)), const("scalar", np.array([], np.int64))
+    one32 = const("one32", np.array([1], np.int32))
+    kept = ""
+    for j in reversed(range(1, ROWS)):
+        guess = node("Gather", ["input_ids", at[j]], f"then/guess{j}", axis=1)
+        hit = node("Equal", [guess, node("Gather", ["wants", at[j - 1]], f"then/want{j}", axis=1)], f"then/hit{j}")
+        if kept:
+            kept = node("Where", [hit, node("Add", [kept, at[1]], f"then/run{j}"), at[0]], f"then/kept{j}")
+        else:
+            kept = node("Cast", [hit], f"then/kept{j}", to=TensorProto.INT64)
+    # On the prompt the rows are not guesses, and counting them all as kept puts the head's extra entries past the
+    # pass's own rows, where the next pass writes over them.
+    full = const("full", np.array([[ROWS - 1]], np.int64))
+    kept = node("Gather", [node("Where", ["given", full, kept], "then/kept_rows"), at[0]], "then/kept", axis=1)
+    row = node("Reshape", [kept, flat], "then/row")
+    step = node("Add", [kept, at[1]], "then/step")
+    node("Add", ["position_ids", step], "then_position_ids")
+    node("Add", ["seqlens", node("Cast", [step], "then/step32", to=TensorProto.INT32)], "then_seqlens")
+    node("Add", ["total", "then/step32"], "then_total")
+    # Token ids go through floats here, which hold them exactly, as WebGPU's Concat returns other memory for int64.
+    floats = node("Cast", ["guesses"], "then/guesses", to=TensorProto.FLOAT)
+    ids = [
+        node("Gather", ["wants/first", row], "then/pick", axis=1),
+        node("Gather", [floats, row], "then/next1", axis=1),
+    ]
+    hidden = where = k = v = ""
+    for j in range(2, ROWS):
+        # The head once more, on its own output for the last row it read and the guess it just made. Its entry
+        # goes one past that row's, where the next pass writes over it.
+        hidden = hidden or node("Gather", [own, row], "then/hidden2", axis=1)
+        if where:
+            where = node("Add", [where, at[1]], f"then/where{j}")
+        else:
+            where = node("Gather", ["then_position_ids", at[0]], "then/where2", axis=1)
+        where32 = node("Cast", [where], f"then/where32_{j}", to=TensorProto.INT32)
+        token = node("Cast", [ids[-1]], f"then/token{j}", to=TensorProto.INT64)
+        swaps = {
+            fc.output[0]: hidden,
+            "follow": node("Gather", ["model.embed_tokens.weight", token], f"then/embed{j}"),
+            "position_ids": where,
+            "seqlens": node("Reshape", [where32, flat], f"then/seqlens{j}"),
+            "total": node("Reshape", [node("Add", [where32, one32], f"then/past{j}"), scalar], f"then/total{j}"),
+            "head_k": k or "head_k_out",
+            "head_v": v or "head_v_out",
+            "guesses": f"then/guess_after{j}",
+            "head_k_out": f"head_k_out{j}",
+            "head_v_out": f"head_v_out{j}",
+        }
+        for was in steps:
+            if was is fc:
+                continue
+            again = copy.deepcopy(was)
+            again.name = f"again{j}/{was.name}"
+            again.input[:] = [swaps.get(x) or (x if x in held or not x else f"again{j}/{x}") for x in was.input]
+            again.output[:] = [swaps.get(x) or f"again{j}/{x}" for x in was.output]
+            g.node.append(again)
+        ids.append(node("Cast", [swaps["guesses"]], f"then/next{j}", to=TensorProto.FLOAT))
+        hidden, k, v = f"again{j}/{own}", swaps["head_k_out"], swaps["head_v_out"]
+        # The page gives these the same buffers as the head's cache, as attention has to write where it reads.
+        g.output.extend([helper.make_tensor_value_info(name, TensorProto.FLOAT16, cache) for name in (k, v)])
+    node("Cast", [node("Concat", ids, "then/ids", axis=1)], "then_input_ids", to=TensorProto.INT64)
     g.output.extend(
         [
             helper.make_tensor_value_info("then_input_ids", TensorProto.INT64, [1, ROWS]),
@@ -347,7 +396,8 @@ def _feed(
     got = dict(zip(names, session.run(names, feeds), strict=True))
     for name in names:
         if name.startswith("present") or name.startswith("head_"):
-            cache[name.replace("present", "past_key_values").removesuffix("_out")] = got[name]
+            # The head's cache comes out once for each time it ran, and the last of them is the one to keep.
+            cache[re.sub(r"_out\d*$", "", name.replace("present", "past_key_values"))] = got[name]
     return got
 
 
@@ -366,28 +416,32 @@ def read(session: "ort.InferenceSession", cache: dict[str, "np.ndarray"], prompt
 def guessed(
     session: "ort.InferenceSession", prompt: list[int], most: int, stop: set[int]
 ) -> list[tuple[list[int], int, int]]:
-    """`eagle.guessed` at one guess a pass over the pass graph: (guesses, how many were kept, own token)."""
+    """`eagle.guessed` over the pass graph, as the page runs it: (guesses, how many were kept, own token)."""
     cache = _empty(session)
     got = read(session, cache, prompt, ROWS)
     seq = [*prompt, int(got["wants"][0, -1])]
-    guesses = [int(got["guesses"][0, -1])]
+    # The pass that read the prompt has one guess to give, and it fills every guess row of the first pass.
+    guesses = [int(got["guesses"][0, -1])] * (ROWS - 1)
     passes = [([], 0, seq[-1])]
     while seq[-1] not in stop and len(seq) - len(prompt) < most:
         got = _feed(session, cache, [seq[-1], *guesses], len(seq) - 1)
         wants = got["wants"][0].tolist()
         kept = accepted(guesses, wants)
-        # The head guessed after every row, and the one after the last right row is next.
-        after = int(got["guesses"][0, kept])
+        # The head guessed after every row, and the one after the last right row is next. The graph has made the
+        # guesses after that one, and they are only in what it would read next.
         at = len(seq) + kept
-        then = [got[f"then_{name}"].ravel().tolist() for name in ("input_ids", "position_ids", "seqlens", "total")]
-        assert then == [[wants[kept], after], [at, at + 1], [at + 1], [at + 2]], f"the graph would read {then} next"
+        ids, *where = [
+            got[f"then_{name}"].ravel().tolist() for name in ("input_ids", "position_ids", "seqlens", "total")
+        ]
+        assert ids[:2] == [wants[kept], int(got["guesses"][0, kept])], f"the graph would read {ids} next"
+        assert where == [[*range(at, at + ROWS)], [at + ROWS - 1], [at + ROWS]], f"the graph would write at {where}"
         # A kept guess can end the answer, and nothing guessed after it counts.
         if (end := next((j for j, g in enumerate(guesses[:kept]) if g in stop), None)) is not None:
             guesses = guesses[:end]
             kept = end
         seq += [*guesses[:kept], wants[kept]]
         passes.append((guesses, kept, wants[kept]))
-        guesses = [after]
+        guesses = ids[1:]
     return passes
 
 
@@ -443,6 +497,6 @@ def export(out: Path) -> None:
     same = alone(run[0], prompt, len(ours)) == ours
     size = sum(path.stat().st_size for path in files) / 1e6
     print(
-        f"{files[0].parent}: {size:.0f} MB. {len(ours)} tokens in {len(passes)} passes at one guess each, "
+        f"{files[0].parent}: {size:.0f} MB. {len(ours)} tokens in {len(passes)} passes at {ROWS - 1} guesses each, "
         f"{len(ours) / len(passes):.2f} a pass, and {'the same text' if same else 'not the same text'} as alone"
     )

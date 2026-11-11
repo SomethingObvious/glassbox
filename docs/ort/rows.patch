@@ -1,3 +1,17 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
+index addf128..7e7ebfe 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
+@@ -1015,7 +1015,8 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
+   Tensor rotated_q;
+ 
+   // Compute m_tile early so it can be passed to CopyKVCache for indirect dispatch.
+-  uint32_t m_tile = parameters.sequence_length_ >= 4 ? 4u : (parameters.sequence_length_ >= 2 ? 2u : 1u);
++  // A pass of 2 or 3 rows runs the 1-row shader for each row, so a row is the same bits in any of them.
++  uint32_t m_tile = parameters.sequence_length_ >= 4 ? 4u : 1u;
+   const uint32_t head_size_vec = static_cast<uint32_t>(parameters.v_head_size_ / 4);
+   m_tile = SelectDecodeMTile(
+       m_tile, tile_size, head_size_vec, Q->DataType()->Size(), kv_cache_quantization_bits,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
 index 3b94812..1356025 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc

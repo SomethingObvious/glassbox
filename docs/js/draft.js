@@ -9,10 +9,10 @@ const TARGET_REVISION = "f9b9656836a4315a690d0270f885b0758923bd13";
 const WEIGHTS = `https://huggingface.co/${TARGET}/resolve/${TARGET_REVISION}/onnx/model_q4f16.onnx_data`;
 // That graph alone and with the head after it, both made for graph capture by `python -m switchboard head`.
 const HEAD =
-  "https://huggingface.co/hoyporti/qwen3-1.7b-eagle3-switchboard/resolve/f6b6619abd92b8ae3e2bb55f75c02d70d617f3a7/onnx";
+  "https://huggingface.co/hoyporti/qwen3-1.7b-eagle3-switchboard/resolve/6bf573089df552c760941f83fcf212ca4bfdd692/onnx";
 const STOP = new Set([151643, 151645]); // Qwen3 <|endoftext|> and <|im_end|>
-// Checking more rows a pass costs WebGPU more than a second guess earns, as the second is right far less often.
-const GUESSES = 1;
+// A third guess would make a pass 4 rows, which onnxruntime's 4-bit matmul takes twice as long over as 3.
+const GUESSES = 2;
 const ENTRIES = 1024; // cache rows on the GPU, the most a prompt and its answer can fill
 // Passes on the GPU at once. A pick takes about 2 ms to reach the CPU, and with one pass at a time the GPU waits it out.
 const DEPTH = 2;
@@ -198,7 +198,7 @@ async function loadModels() {
   status("Loading the model onto the GPU...", 1);
   const hosted = { path: "model_q4f16.onnx_data", data: weights };
   state.big = await captured(graph, [hosted], 1);
-  state.pass = await captured(pass, [hosted, { path: "head.onnx.data", data: headWeights }], 2, state.big);
+  state.pass = await captured(pass, [hosted, { path: "head.onnx.data", data: headWeights }], GUESSES + 1, state.big);
 }
 
 /**
@@ -244,10 +244,11 @@ async function captured(bytes, externalData, rows, kin) {
       shapes[name] ? tensor(...shapes[name]) : (kin?.feeds[name] ?? tensor(...cache)),
     ]),
   );
-  // The new cache rows are written into the old cache's buffer.
+  // The new cache rows are written into the old cache's buffer. The head runs once for each guess, and its cache
+  // comes out each time, all into the one buffer.
   const fetches = Object.fromEntries(
     session.outputNames.map((name) => {
-      const past = name.replace("present", "past_key_values").replace(/_out$/, "");
+      const past = name.replace("present", "past_key_values").replace(/_out\d*$/, "");
       return [name, feeds[past] ?? tensor(...shapes[name])];
     }),
   );
@@ -354,13 +355,13 @@ function place(s, ids, at, nexts = []) {
  * head's. The same trip leaves what the next pass reads in the input buffers.
  */
 function picks(s) {
-  const names = s.fetches.guesses ? ["wants", "guesses"] : ["wants"];
+  const names = s.fetches.guesses ? ["wants", "guesses", "then_input_ids"] : ["wants"];
   const ints = (bytes) => (bytes ? Array.from(new BigInt64Array(bytes, 0, s.rows), Number) : []);
   return readBack(
     s,
     names.map((name) => s.fetches[name]),
     s.links,
-  ).then(([wants, guesses]) => ({ wants: ints(wants), guesses: ints(guesses) }));
+  ).then(([wants, guesses, rows]) => ({ wants: ints(wants), guesses: ints(guesses), rows: ints(rows) }));
 }
 
 /** One pass over `ids` at position `at`, as `place` reads them, and its picks. */
@@ -409,9 +410,9 @@ async function read(s, prompt) {
 }
 
 /**
- * The loop of switchboard/eagle.py over the pass graph, one guess at a time. Each pass is its guesses, how many
+ * The loop of switchboard/eagle.py over the pass graph, `GUESSES` guesses a pass. Each pass is its guesses, how many
  * were kept, the big model's own token and its seconds. Both ways start their clocks once the prompt is read, which
- * the pass graph does two tokens a pass and the big graph one. The graph picks the next pass's rows the way this
+ * the pass graph does three tokens a pass and the big graph one. The graph picks the next pass's rows the way this
  * loop does, so the loop only follows along. Once the head has cost more time than `pace`, the seconds a token
  * takes alone, would have, the rest is written without it.
  */
@@ -427,7 +428,8 @@ async function guessed(prompt, most, pace = 0, each = () => {}) {
     start = performance.now();
     each(passes);
   };
-  let guesses = got.guesses.slice(-1);
+  // The pass that read the prompt has one guess to give, and it fills every guess row of the first pass.
+  let guesses = Array(GUESSES).fill(got.guesses.at(-1));
   let behind = false;
   if (!more()) return passes;
   place(state.pass, [seq.at(-1), ...guesses], seq.length - 1);
@@ -436,8 +438,9 @@ async function guessed(prompt, most, pace = 0, each = () => {}) {
     () => {},
     (got) => {
       let kept = accepted(guesses, got.wants);
-      // The head guessed after every row, and the one after the last right row is next.
-      const after = got.guesses[kept];
+      // The graph has already picked what the next pass reads: the big model's own token, the head's guess after
+      // the last right row, and its guesses after that one.
+      const next = got.rows.slice(1);
       // A kept guess can end the answer, and nothing guessed after it counts.
       const end = guesses.slice(0, kept).findIndex((id) => STOP.has(id));
       if (end >= 0) {
@@ -445,7 +448,7 @@ async function guessed(prompt, most, pace = 0, each = () => {}) {
         kept = end;
       }
       wrote(guesses, kept, got.wants[kept]);
-      guesses = [after];
+      guesses = next;
       behind = passes.length > TRIAL && secondsIn(passes) > pace * (seq.length - prompt.length - 1);
       return more() && !(pace && behind);
     },
@@ -530,17 +533,17 @@ async function run() {
       enable_thinking: false,
     });
     const prompt = state.tok.encode(chat, { add_special_tokens: false });
-    // A pass writes a row for its guess, and the passes still on the GPU when the answer ends write past it too.
-    const room = ENTRIES - prompt.length - 2 * (DEPTH + 2);
+    // A pass writes a row for each guess, and the passes still on the GPU when the answer ends write past it too.
+    const room = ENTRIES - prompt.length - (GUESSES + 1) * (DEPTH + 2);
     if (room < 16) throw new Error(`the prompt is ${prompt.length} tokens, and this run has room for ${ENTRIES}`);
     resetStats(depth);
     // The first passes of each shape compile shaders, so both ways get a few before the clock counts.
     status("Warming up...", 1);
     await guessed(prompt, 8);
     await alone(prompt, 3);
-    // Alone goes first, so the guessed run knows the pace it has to beat. A last pass that keeps its guess writes
-    // one token more than asked for, which alone writes too.
-    const solo = await alone(prompt, Math.min(most, room) + 1, (done) =>
+    // Alone goes first, so the guessed run knows the pace it has to beat. A last pass that keeps its guesses writes
+    // that many tokens more than asked for, which alone writes too.
+    const solo = await alone(prompt, Math.min(most, room) + GUESSES, (done) =>
       status(`Writing alone on this GPU, ${done.length} tokens so far...`),
     );
     const pace = solo.times.reduce((a, b) => a + b) / (solo.times.length - 1);
@@ -570,7 +573,7 @@ async function run() {
       const off = passes.findIndex((pass, i) => i && !pass.guesses.length);
       said =
         `Written on this GPU just now. The same ${ours.length} tokens took ${secondsIn(steps).toFixed(2)} s with ` +
-        `the head guessing one token a pass and ${total(solo.times)} s alone, both after reading the prompt.` +
+        `the head guessing ${depth} tokens a pass and ${total(solo.times)} s alone, both after reading the prompt.` +
         (off < 0 ? "" : ` Its guesses cost more time than they saved, so it was switched off after ${off - 1} passes.`);
     } else {
       const [a, b] = await topTwo([...prompt, ...ours.slice(0, same)], same);
