@@ -12,11 +12,114 @@ index addf128..7e7ebfe 100644
    const uint32_t head_size_vec = static_cast<uint32_t>(parameters.v_head_size_ / 4);
    m_tile = SelectDecodeMTile(
        m_tile, tile_size, head_size_vec, Q->DataType()->Size(), kv_cache_quantization_bits,
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
+index 959bb0a..d100f3c 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
+@@ -114,6 +114,20 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
+                              WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
+ }
+ 
++Status MatMulNBitsRowsProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  const auto& a = shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias);
++  const auto& b = shader.AddInput("input_b");
++  const auto& scales_b = shader.AddInput("scales_b");
++  const auto& output = shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++  return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_rows.wgsl.template",
++                             WGSL_TEMPLATE_PARAMETER(rows, rows_),
++                             WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
++                             WGSL_TEMPLATE_VARIABLE(a, a),
++                             WGSL_TEMPLATE_VARIABLE(b, b),
++                             WGSL_TEMPLATE_VARIABLE(output, output),
++                             WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
++}
++
+ Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
+   const Tensor* a = context.Input(0);
+   const Tensor* b = context.Input(1);
+@@ -339,6 +353,38 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+   constexpr uint32_t kU32Components = 4;
+   uint32_t components_b_with_u32 = components_b * kU32Components;
+   uint32_t K_of_b = (n_blocks_per_col * blob_size) / components_b_with_u32;
++
++  // 2 or 3 rows go through one set of workgroups that reads the weights once for all of them, where the
++  // program below gives every row workgroups of its own. Only on the vendor it was measured on.
++  const bool use_rows_program =
++      M >= 2u && M <= 3u && !broadcast_a &&
++      nbits == 4 && block_size == 32u &&
++      !has_zero_points && !has_bias && !has_weight_idx && !acc_f32 &&
++      components_a == 4u && components_b == 4u &&
++      context.AdapterInfo().vendor == std::string_view{"nvidia"};
++  if (use_rows_program) {
++    constexpr uint32_t rows_tile_size = 16;
++    const uint32_t rows_num_N_tile = (N + rows_tile_size - 1) / rows_tile_size;
++    MatMulNBitsRowsProgram rows_program{rows_tile_size, M};
++    rows_program.SetWorkgroupSize(workgroup_size);
++    rows_program.SetDispatchGroupSize(rows_num_N_tile, 1, batch_count);
++    rows_program
++        .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_a)},
++                    {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_b_with_u32)},
++                    {scales, ProgramTensorMetadataDependency::TypeAndRank}})
++        .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank})
++        .AddUniformVariables({{N},
++                              {K},
++                              {K / components_a},
++                              {K_of_b},
++                              {block_size},
++                              {n_blocks_per_col},
++                              {rows_num_N_tile},
++                              {batch_count}})
++        .CacheHint(M, rows_tile_size);
++    return context.RunProgram(rows_program);
++  }
++
+   MatMulNBitsProgram program{tile_size, static_cast<uint32_t>(nbits), has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, single_scale_weights, tile_size_k_vec, broadcast_a, acc_f32};
+   program.SetWorkgroupSize(workgroup_size);
+   uint32_t num_N_tile = (N + tile_size - 1) / tile_size;
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
+index 06e43ce..d1a15bd 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
+@@ -73,6 +73,26 @@ class MatMulNBitsProgram final : public Program<MatMulNBitsProgram> {
+   bool acc_f32_;
+ };
+ 
++class MatMulNBitsRowsProgram final : public Program<MatMulNBitsRowsProgram> {
++ public:
++  MatMulNBitsRowsProgram(uint32_t tile_size, uint32_t rows)
++      : Program{"MatMulNBitsRows"}, tile_size_(tile_size), rows_(rows) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"N", ProgramUniformVariableDataType::Uint32},
++      {"K", ProgramUniformVariableDataType::Uint32},
++      {"K_of_a", ProgramUniformVariableDataType::Uint32},
++      {"K_of_b", ProgramUniformVariableDataType::Uint32},
++      {"block_size", ProgramUniformVariableDataType::Uint32},
++      {"blocks_per_col", ProgramUniformVariableDataType::Uint32},
++      {"num_N_tile", ProgramUniformVariableDataType::Uint32},
++      {"batch_count", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  uint32_t tile_size_;
++  uint32_t rows_;
++};
++
+ class MatMulNBits final : public WebGpuKernel {
+  public:
+   MatMulNBits(const OpKernelInfo& info) : WebGpuKernel(info) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
-index 3b94812..1356025 100644
+index 3b94812..578369c 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
-@@ -35,6 +35,9 @@ namespace {
+@@ -3,6 +3,7 @@
+ 
+ #include "contrib_ops/webgpu/quantization/matmul_nbits_mlp.h"
+ 
++#include <algorithm>
+ #include <optional>
+ 
+ #include "contrib_ops/webgpu/quantization/matmul_nbits.h"
+@@ -35,6 +36,9 @@ namespace {
  
  constexpr uint32_t kFusedDecodeFastPathBits = 4u;
  constexpr uint32_t kFusedDecodeFastPathBlockSize = 32u;
@@ -26,7 +129,7 @@ index 3b94812..1356025 100644
  
  // Emits the WGSL expression that applies the gate activation. The result must use
  // the variable names produced by the inline kernel (`gate_value`) and the shader
-@@ -63,7 +66,8 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+@@ -63,7 +67,8 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
                                uint32_t tile_size_k_vec,
                                uint32_t k_unroll_tiles,
                                MlpActivationKind activation_kind,
@@ -36,7 +139,7 @@ index 3b94812..1356025 100644
        : Program{"MatMulNBitsMlpDecode"},
          tile_size_(tile_size),
          has_gate_bias_(has_gate_bias),
-@@ -75,7 +79,8 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+@@ -75,7 +80,8 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
          tile_size_k_vec_(tile_size_k_vec),
          k_unroll_tiles_(k_unroll_tiles),
          activation_kind_(activation_kind),
@@ -46,7 +149,7 @@ index 3b94812..1356025 100644
  
    Status GenerateShaderCode(ShaderHelper& shader) const override {
      const auto& a = shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
-@@ -122,6 +127,7 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+@@ -122,6 +128,7 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
                                 WGSL_TEMPLATE_PARAMETER(has_skip_output, has_skip_output_),
                                 WGSL_TEMPLATE_PARAMETER(has_up_bias, has_up_bias_),
                                 WGSL_TEMPLATE_PARAMETER(k_unroll_tiles, k_unroll_tiles_),
@@ -54,15 +157,113 @@ index 3b94812..1356025 100644
                                 WGSL_TEMPLATE_PARAMETER(single_scale_weights, single_scale_weights_),
                                 WGSL_TEMPLATE_PARAMETER(sub_tile_count, sub_tile_count),
                                 WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
-@@ -162,6 +168,7 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
+@@ -162,6 +169,105 @@ class MatMulNBitsMlpDecodeProgram final : public Program<MatMulNBitsMlpDecodePro
    uint32_t k_unroll_tiles_;
    MlpActivationKind activation_kind_;
    bool acc_f32_;
 +  uint32_t rows_;
++};
++
++class MatMulNBitsMlpWideProgram final : public Program<MatMulNBitsMlpWideProgram> {
++ public:
++  MatMulNBitsMlpWideProgram(uint32_t tile_cols,
++                            uint32_t k,
++                            bool has_gate_bias,
++                            bool has_up_bias,
++                            bool has_norm_input,
++                            bool has_skip_input,
++                            bool has_skip_output,
++                            bool single_scale_weights,
++                            MlpActivationKind activation_kind,
++                            uint32_t rows)
++      : Program{"MatMulNBitsMlpWide"},
++        tile_cols_(tile_cols),
++        k_(k),
++        has_gate_bias_(has_gate_bias),
++        has_up_bias_(has_up_bias),
++        has_norm_input_(has_norm_input),
++        has_skip_input_(has_skip_input),
++        has_skip_output_(has_skip_output),
++        single_scale_weights_(single_scale_weights),
++        activation_kind_(activation_kind),
++        rows_(rows) {}
++
++  Status GenerateShaderCode(ShaderHelper& shader) const override {
++    const auto& a = shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
++    const auto* skip = has_skip_input_ ? &shader.AddInput("skip", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias) : nullptr;
++    const auto* norm_scale = has_norm_input_ ? &shader.AddInput("norm_scale", ShaderUsage::UseValueTypeAlias) : nullptr;
++    const auto& gate_b = shader.AddInput("gate_b");
++    const auto& gate_scales_b = shader.AddInput("gate_scales_b");
++    const auto& up_b = shader.AddInput("up_b");
++    const auto& up_scales_b = shader.AddInput("up_scales_b");
++    if (has_gate_bias_) {
++      shader.AddInput("gate_bias", ShaderUsage::UseUniform);
++    }
++    if (has_up_bias_) {
++      shader.AddInput("up_bias", ShaderUsage::UseUniform);
++    }
++    const auto& output = shader.AddOutput("output",
++                                          ShaderUsage::UseElementTypeAlias);
++    const auto* input_skip_bias_sum = has_skip_output_
++                                          ? &shader.AddOutput("input_skip_bias_sum",
++                                                              ShaderUsage::UseValueTypeAlias |
++                                                                  ShaderUsage::UseElementTypeAlias)
++                                          : nullptr;
++    const uint32_t a_length = k_ / 4u;
++    const uint32_t a_per_thread = a_length / WorkgroupSizeX();
++    const uint32_t k_tiles = k_ / 1024u;
++
++    return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_mlp_wide.wgsl.template",
++                               WGSL_TEMPLATE_PARAMETER(a_length, a_length),
++                               WGSL_TEMPLATE_PARAMETER(a_per_thread, a_per_thread),
++                               WGSL_TEMPLATE_PARAMETER(activation_kind, static_cast<uint32_t>(activation_kind_)),
++                               WGSL_TEMPLATE_PARAMETER(has_gate_bias, has_gate_bias_),
++                               WGSL_TEMPLATE_PARAMETER(has_norm_input, has_norm_input_),
++                               WGSL_TEMPLATE_PARAMETER(has_skip_input, has_skip_input_),
++                               WGSL_TEMPLATE_PARAMETER(has_skip_output, has_skip_output_),
++                               WGSL_TEMPLATE_PARAMETER(has_up_bias, has_up_bias_),
++                               WGSL_TEMPLATE_PARAMETER(k_tiles, k_tiles),
++                               WGSL_TEMPLATE_PARAMETER(rows, rows_),
++                               WGSL_TEMPLATE_PARAMETER(single_scale_weights, single_scale_weights_),
++                               WGSL_TEMPLATE_PARAMETER(tile_cols, tile_cols_),
++                               WGSL_TEMPLATE_VARIABLE(a, a),
++                               WGSL_TEMPLATE_VARIABLE(gate_b, gate_b),
++                               WGSL_TEMPLATE_VARIABLE(gate_scales_b, gate_scales_b),
++                               WGSL_TEMPLATE_OPTIONAL_VARIABLE(input_skip_bias_sum, input_skip_bias_sum),
++                               WGSL_TEMPLATE_OPTIONAL_VARIABLE(norm_scale, norm_scale),
++                               WGSL_TEMPLATE_VARIABLE(output, output),
++                               WGSL_TEMPLATE_OPTIONAL_VARIABLE(skip, skip),
++                               WGSL_TEMPLATE_VARIABLE(up_b, up_b),
++                               WGSL_TEMPLATE_VARIABLE(up_scales_b, up_scales_b));
++  }
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"N", ProgramUniformVariableDataType::Uint32},
++      {"K", ProgramUniformVariableDataType::Uint32},
++      {"K_of_a", ProgramUniformVariableDataType::Uint32},
++      {"K_of_b", ProgramUniformVariableDataType::Uint32},
++      {"block_size", ProgramUniformVariableDataType::Uint32},
++      {"blocks_per_col", ProgramUniformVariableDataType::Uint32},
++      {"num_N_tile", ProgramUniformVariableDataType::Uint32},
++      {"batch_count", ProgramUniformVariableDataType::Uint32},
++      {"skip_size", ProgramUniformVariableDataType::Uint32},
++      {"epsilon", ProgramUniformVariableDataType::Float32});
++
++ private:
++  uint32_t tile_cols_;
++  uint32_t k_;
++  bool has_gate_bias_;
++  bool has_up_bias_;
++  bool has_norm_input_;
++  bool has_skip_input_;
++  bool has_skip_output_;
++  bool single_scale_weights_;
++  MlpActivationKind activation_kind_;
++  uint32_t rows_;
  };
  
  class MatMulNBitsMlpProgram final : public Program<MatMulNBitsMlpProgram> {
-@@ -293,8 +300,9 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -293,8 +399,9 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
    const bool has_skip_input = skip != nullptr;
    const bool has_skip_output = input_skip_bias_sum != nullptr;
  
@@ -73,7 +274,7 @@ index 3b94812..1356025 100644
        bits_ == kFusedDecodeFastPathBits &&
        block_size == kFusedDecodeFastPathBlockSize;
    const bool has_norm_input = norm_scale != nullptr;
-@@ -314,20 +322,11 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -314,20 +421,11 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
    const bool would_use_dp4a_unfused =
        CanApplyDP4AMatrixMatMulNBits(context, accuracy_level_, block_size, N, K, components_a,
                                      M, /*has_weight_idx_indirect=*/false, y);
@@ -96,7 +297,86 @@ index 3b94812..1356025 100644
  
    if (can_use_decode_fast_path) {
      ORT_ENFORCE(bits_ == kFusedDecodeFastPathBits,
-@@ -410,7 +409,6 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -391,6 +489,78 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+     const bool decode_has_skip_input = has_skip_input && !exceeds_storage_buffer_limit;
+     const bool decode_has_skip_output = has_skip_output && !exceeds_storage_buffer_limit;
+ 
++    // A few rows go through a workgroup that takes many columns and reads A once, which keeps a
++    // further row nearly free. It needs all of A for every row in workgroup memory.
++    const uint32_t wide_bytes = M * (2u * K + 1024u) + 4u * 128u + 4u * M;
++    const bool can_use_wide =
++        M <= 3u &&
++        components_a == 4u &&
++        components_b == 4u &&
++        (K % 1024u) == 0u &&
++        context.AdapterInfo().vendor == std::string_view{"nvidia"} &&
++        wide_bytes <= context.DeviceLimits().maxComputeWorkgroupStorageSize;
++    if (can_use_wide) {
++      // The GPU runs about 100 workgroups of this size at once, and any past that wait for a second round.
++      const uint32_t tile_cols = std::clamp((CeilDiv(N, 104u) + 3u) & ~3u, 8u, 64u);
++      const uint32_t wide_num_N_tile = CeilDiv(N, tile_cols);
++      MatMulNBitsMlpWideProgram wide{tile_cols,
++                                     K,
++                                     has_gate_bias,
++                                     has_up_bias,
++                                     decode_has_norm_input,
++                                     decode_has_skip_input,
++                                     decode_has_skip_output,
++                                     single_scale_weights,
++                                     activation_kind_,
++                                     M};
++      wide.SetWorkgroupSize(128);
++      wide.SetDispatchGroupSize(wide_num_N_tile, 1, batch_count);
++      wide.AddInput({decode_a, ProgramTensorMetadataDependency::TypeAndRank, 4});
++      if (decode_has_skip_input) {
++        wide.AddInput({skip, ProgramTensorMetadataDependency::TypeAndRank, 4});
++      }
++      if (decode_has_norm_input) {
++        wide.AddInput({norm_scale, ProgramTensorMetadataDependency::TypeAndRank, 4});
++      }
++      wide
++          .AddInputs({{gate_b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_b_with_u32)},
++                      {gate_scales, ProgramTensorMetadataDependency::TypeAndRank},
++                      {up_b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_b_with_u32)},
++                      {up_scales, ProgramTensorMetadataDependency::TypeAndRank}})
++          .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank})
++          .AddUniformVariables({{N},
++                                {K},
++                                {K / 4u},
++                                {K_of_b},
++                                {block_size},
++                                {n_blocks_per_col},
++                                {wide_num_N_tile},
++                                {batch_count},
++                                {decode_has_skip_input ? onnxruntime::narrow<uint32_t>(skip->Shape().Size()) : 0u},
++                                {epsilon_}})
++          .CacheHint(single_scale_weights,
++                     has_gate_bias,
++                     has_up_bias,
++                     decode_has_norm_input,
++                     decode_has_skip_input,
++                     decode_has_skip_output,
++                     tile_cols,
++                     K,
++                     static_cast<uint32_t>(activation_kind_),
++                     M,
++                     "wide_4bit");
++      if (decode_has_skip_output) {
++        wide.AddOutput({input_skip_bias_sum, ProgramTensorMetadataDependency::TypeAndRank, 4});
++      }
++      if (has_gate_bias) {
++        wide.AddInput({gate_bias, ProgramTensorMetadataDependency::None});
++      }
++      if (has_up_bias) {
++        wide.AddInput({up_bias, ProgramTensorMetadataDependency::None});
++      }
++      return context.RunProgram(wide);
++    }
++
+     uint32_t workgroup_size = 128;
+     uint32_t tile_size = 8;
+     uint32_t tile_size_k_vec =
+@@ -410,7 +580,6 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
      }
  
      const uint32_t num_N_tile = CeilDiv(N, tile_size);
@@ -104,7 +384,7 @@ index 3b94812..1356025 100644
  
      MatMulNBitsMlpDecodeProgram program{tile_size,
                                          has_gate_bias,
-@@ -422,7 +420,8 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -422,7 +591,8 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
                                          tile_size_k_vec,
                                          k_unroll_tiles,
                                          activation_kind_,
@@ -114,7 +394,7 @@ index 3b94812..1356025 100644
      program.SetWorkgroupSize(workgroup_size);
      program.SetDispatchGroupSize(num_N_tile, 1, batch_count);
      program.AddInput({decode_a, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_a)});
-@@ -458,6 +457,7 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -458,6 +628,7 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
                     k_unroll_tiles,
                     static_cast<uint32_t>(activation_kind_),
                     acc_f32,
@@ -428,31 +708,249 @@ index 4e8fa1a..472d497 100644
      }
    }
  }  // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp_wide.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp_wide.wgsl.template
+new file mode 100644
+index 0000000..bbb00db
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp_wide.wgsl.template
+@@ -0,0 +1,182 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++// The fused 4-bit gate and up projections for a few rows of A, with a workgroup that takes many
++// output columns. A workgroup reads A from its buffer once and keeps all of it, scaled by the
++// norm, in workgroup memory. Reads from buffers are what this kernel waits on, so the fewer of
++// them go to A, the less a further row costs.
++//
++// Layout: 128 threads. Thread `idx` (0..31) of each of the 4 groups `idy` takes weight word `idx`
++// of every k tile of 32 words, for output column `first + idy`, so the 32 threads of a group read
++// 32 neighbouring words. The columns of a workgroup go 4 at a time.
++//
++// Fixed by the caller: 4-bit weights, block size 32, A and the weights bound as vec4, and K a
++// multiple of 1024.
++
++#param rows
++#param tile_cols
++// K / 4, the length of a row of A in vec4.
++#param a_length
++// a_length / workgroup size, the vec4 of A each thread reads for a row.
++#param a_per_thread
++// K / 1024
++#param k_tiles
++#param has_norm_input
++#param has_skip_input
++#param has_skip_output
++#param has_gate_bias
++#param has_up_bias
++#param single_scale_weights
++// Mirrors MlpActivationKind in matmul_nbits_mlp.h: 0 = SiLU.
++#param activation_kind
++
++#use .getByOffset .setByOffset
++
++#if has_norm_input
++var<workgroup> sum_squared_shared : array<f32, workgroup_size_x>;
++var<workgroup> inv_std_shared : array<f32, rows>;
++#endif
++var<workgroup> tile_A : array<input_a_value_t, a_length * rows>;
++// The 32 partial sums of 4 columns for every row.
++var<workgroup> gate_partial : array<f32, 128 * rows>;
++var<workgroup> up_partial : array<f32, 128 * rows>;
++
++fn load_merged_input(input_offset: u32) -> input_a_value_t {
++#if has_skip_input
++    let skip_offset = input_offset % (uniforms.skip_size / 4);
++    return a.getByOffset(input_offset) + input_a_value_t(skip.getByOffset(skip_offset));
++#else
++    return a.getByOffset(input_offset);
++#endif
++}
++
++// The 8 weights of one word, in the order of K, times their block's scale.
++fn unpack_lower(word: u32, scale: f32) -> vec4<f32> {
++  let lower = vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
++  let upper = vec4<f32>(unpack4xU8((word >> 4) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
++  return vec4<f32>(lower[0], upper[0], lower[1], upper[1]) * scale;
++}
++
++fn unpack_upper(word: u32, scale: f32) -> vec4<f32> {
++  let lower = vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
++  let upper = vec4<f32>(unpack4xU8((word >> 4) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
++  return vec4<f32>(lower[2], upper[2], lower[3], upper[3]) * scale;
++}
++
++$MAIN {
++  let batch = workgroup_idx / uniforms.num_N_tile;
++  let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_cols;
++  let idx = local_idx % 32u;
++  let idy = local_idx / 32u;
++
++  // Each thread keeps what it read of A for the norm's sum, so staging does not read it again.
++  var raw : array<input_a_value_t, a_per_thread * rows>;
++  for (var r = 0u; r < rows; r++) {
++    var sum_squared_local = 0.0;
++    for (var q = 0u; q < a_per_thread; q++) {
++      let input_offset = (batch * rows + r) * uniforms.K_of_a + q * workgroup_size_x + local_idx;
++      let merged_value = load_merged_input(input_offset);
++#if has_skip_output
++      if (b_global_base == 0u && batch < uniforms.batch_count) {
++        input_skip_bias_sum.setByOffset(input_offset, input_skip_bias_sum_value_t(merged_value));
++      }
++#endif
++      raw[r * a_per_thread + q] = merged_value;
++      let a_f32 = vec4<f32>(merged_value);
++      sum_squared_local += dot(a_f32, a_f32);
++    }
++#if has_norm_input
++    sum_squared_shared[local_idx] = sum_squared_local;
++    workgroupBarrier();
++    if (local_idx == 0u) {
++      var total = 0.0;
++      for (var i = 0u; i < workgroup_size_x; i++) {
++        total += sum_squared_shared[i];
++      }
++      inv_std_shared[r] = inverseSqrt(total / f32(uniforms.K) + uniforms.epsilon);
++    }
++    workgroupBarrier();
++#endif
++  }
++  for (var q = 0u; q < a_per_thread; q++) {
++    let k_offset = q * workgroup_size_x + local_idx;
++#if has_norm_input
++    let scale = norm_scale.getByOffset(k_offset);
++#endif
++    for (var r = 0u; r < rows; r++) {
++#if has_norm_input
++      tile_A[r * a_length + k_offset] = raw[r * a_per_thread + q] * input_a_value_t(input_a_element_t(inv_std_shared[r])) * scale;
++#else
++      tile_A[r * a_length + k_offset] = raw[r * a_per_thread + q];
++#endif
++    }
++  }
++  workgroupBarrier();
++
++#if single_scale_weights
++  let gate_scale_b = f32(gate_scales_b.getByOffset(0));
++  let up_scale_b = f32(up_scales_b.getByOffset(0));
++#endif
++
++  for (var phase = 0u; phase < tile_cols / 4u; phase++) {
++    let first = b_global_base + phase * 4u;
++    let b_global = first + idy;
++    var gate_sum : array<f32, rows>;
++    var up_sum : array<f32, rows>;
++    if (b_global < uniforms.N) {
++      for (var kt = 0u; kt < k_tiles; kt++) {
++        let unit = kt * 32u + idx;
++#if !single_scale_weights
++        let gate_scale_b = f32(gate_scales_b.getByOffset(b_global * uniforms.blocks_per_col + unit));
++        let up_scale_b = f32(up_scales_b.getByOffset(b_global * uniforms.blocks_per_col + unit));
++#endif
++        let gate_b_value = gate_b.getByOffset(b_global * uniforms.K_of_b + unit);
++        let up_b_value = up_b.getByOffset(b_global * uniforms.K_of_b + unit);
++        for (var i = 0u; i < 4u; i++) {
++          let gate_b0 = unpack_lower(gate_b_value[i], gate_scale_b);
++          let gate_b1 = unpack_upper(gate_b_value[i], gate_scale_b);
++          let up_b0 = unpack_lower(up_b_value[i], up_scale_b);
++          let up_b1 = unpack_upper(up_b_value[i], up_scale_b);
++          for (var r = 0u; r < rows; r++) {
++            let at = r * a_length + unit * 8u + i * 2u;
++            let a0 = vec4<f32>(tile_A[at]);
++            let a1 = vec4<f32>(tile_A[at + 1u]);
++            gate_sum[r] += dot(a0, gate_b0) + dot(a1, gate_b1);
++            up_sum[r] += dot(a0, up_b0) + dot(a1, up_b1);
++          }
++        }
++      }
++    }
++    for (var r = 0u; r < rows; r++) {
++      gate_partial[(idy * rows + r) * 32u + idx] = gate_sum[r];
++      up_partial[(idy * rows + r) * 32u + idx] = up_sum[r];
++    }
++    workgroupBarrier();
++
++    if (local_idx < 4u) {
++      let b_out = first + local_idx;
++      if (b_out < uniforms.N && batch < uniforms.batch_count) {
++        for (var r = 0u; r < rows; r++) {
++          var gate_output_value = 0.0;
++          var up_output_value = 0.0;
++          for (var b = 0u; b < 32u; b++) {
++            gate_output_value += gate_partial[(local_idx * rows + r) * 32u + b];
++            up_output_value += up_partial[(local_idx * rows + r) * 32u + b];
++          }
++#if has_gate_bias
++          gate_output_value += f32(gate_bias[b_out]);
++#endif
++#if has_up_bias
++          up_output_value += f32(up_bias[b_out]);
++#endif
++#if activation_kind == 0
++          let activated_value = gate_output_value * (1.0 / (1.0 + exp(-gate_output_value)));
++#endif
++          output.setByOffset((batch * rows + r) * uniforms.N + b_out, output_element_t(activated_value * up_output_value));
++        }
++      }
++    }
++    // The next 4 columns write over the partial sums.
++    workgroupBarrier();
++  }
++}  // MAIN
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
-index 7137b6a..28be9d8 100644
+index 7137b6a..c844f0c 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
-@@ -33,7 +33,8 @@ class MatMulNBitsQkvDecodeProgram final
+@@ -33,7 +33,9 @@ class MatMulNBitsQkvDecodeProgram final
                                bool has_norm,
                                bool has_skip_input,
                                bool has_skip_output,
 -                              bool acc_f32)
 +                              bool acc_f32,
-+                              uint32_t rows)
++                              uint32_t rows,
++                              bool registers)
        : Program{"MatMulNBitsQkvDecode"},
          tile_size_(tile_size),
          single_scale_weights_(single_scale_weights),
-@@ -42,7 +43,8 @@ class MatMulNBitsQkvDecodeProgram final
+@@ -42,7 +44,9 @@ class MatMulNBitsQkvDecodeProgram final
          has_norm_(has_norm),
          has_skip_input_(has_skip_input),
          has_skip_output_(has_skip_output),
 -        acc_f32_(acc_f32) {
 +        acc_f32_(acc_f32),
-+        rows_(rows) {
++        rows_(rows),
++        registers_(registers) {
      // The no-norm variant runs against an already-normalized input tensor and therefore
      // never owns the residual skip path nor the residual passthrough output.
      ORT_ENFORCE(has_norm_ || (!has_skip_input_ && !has_skip_output_),
-@@ -87,6 +89,7 @@ class MatMulNBitsQkvDecodeProgram final
+@@ -77,6 +81,27 @@ class MatMulNBitsQkvDecodeProgram final
+     const uint32_t a_length_per_tile = tile_size_k / components_a;
+     const uint32_t sub_tile_count = WorkgroupSizeX() / tile_size_k_vec;
+ 
++    if (registers_) {
++      return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_qkv_rows.wgsl.template",
++                                 WGSL_TEMPLATE_PARAMETER(has_skip_input, has_skip_input_),
++                                 WGSL_TEMPLATE_PARAMETER(has_skip_output, has_skip_output_),
++                                 WGSL_TEMPLATE_PARAMETER(rows, rows_),
++                                 WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
++                                 WGSL_TEMPLATE_VARIABLE(a, a),
++                                 WGSL_TEMPLATE_OPTIONAL_VARIABLE(input_skip_bias_sum, input_skip_bias_sum),
++                                 WGSL_TEMPLATE_VARIABLE(k_b, k_b),
++                                 WGSL_TEMPLATE_VARIABLE(k_output, k_output),
++                                 WGSL_TEMPLATE_VARIABLE(k_scales_b, k_scales_b),
++                                 WGSL_TEMPLATE_OPTIONAL_VARIABLE(norm_scale, norm_scale),
++                                 WGSL_TEMPLATE_VARIABLE(q_b, q_b),
++                                 WGSL_TEMPLATE_VARIABLE(q_output, q_output),
++                                 WGSL_TEMPLATE_VARIABLE(q_scales_b, q_scales_b),
++                                 WGSL_TEMPLATE_OPTIONAL_VARIABLE(skip, skip),
++                                 WGSL_TEMPLATE_VARIABLE(v_b, v_b),
++                                 WGSL_TEMPLATE_VARIABLE(v_output, v_output),
++                                 WGSL_TEMPLATE_VARIABLE(v_scales_b, v_scales_b));
++    }
++
+     return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_qkv.wgsl.template",
+                                WGSL_TEMPLATE_PARAMETER(a_length_per_tile, a_length_per_tile),
+                                WGSL_TEMPLATE_PARAMETER(acc_f32, acc_f32_),
+@@ -87,6 +112,7 @@ class MatMulNBitsQkvDecodeProgram final
                                 WGSL_TEMPLATE_PARAMETER(has_skip_input, has_skip_input_),
                                 WGSL_TEMPLATE_PARAMETER(has_skip_output, has_skip_output_),
                                 WGSL_TEMPLATE_PARAMETER(k_unroll_tiles, k_unroll_tiles_),
@@ -460,15 +958,16 @@ index 7137b6a..28be9d8 100644
                                 WGSL_TEMPLATE_PARAMETER(single_scale_weights, single_scale_weights_),
                                 WGSL_TEMPLATE_PARAMETER(sub_tile_count, sub_tile_count),
                                 WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
-@@ -129,6 +132,7 @@ class MatMulNBitsQkvDecodeProgram final
+@@ -129,6 +155,8 @@ class MatMulNBitsQkvDecodeProgram final
    bool has_skip_input_;
    bool has_skip_output_;
    bool acc_f32_;
 +  uint32_t rows_;
++  bool registers_;
  };
  
  }  // namespace
-@@ -206,13 +210,11 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -206,13 +234,11 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
        !would_use_subgroup_unfused &&
        CanApplyDP4AMatrixMatMulNBits(context, accuracy_level_, block_size, Nq, K, GetMaxComponents(K),
                                      M, /*has_weight_idx_indirect=*/false, q_output);
@@ -487,7 +986,7 @@ index 7137b6a..28be9d8 100644
  
    // The fused MatMulNBitsQkv shader binds every Q/K/V weight + scales tensor and the
    // norm/skip tensors as storage buffers. Devices with a tight maxStorageBuffersPerShaderStage
-@@ -233,8 +235,7 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -233,8 +259,7 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
    const bool exceeds_storage_buffer_limit =
        required_storage_buffers > context.DeviceLimits().maxStorageBuffersPerShaderStage;
  
@@ -497,7 +996,27 @@ index 7137b6a..28be9d8 100644
      Tensor normalized_a = context.CreateGPUTensor(a->DataType(), a->Shape());
  
      if (skip != nullptr) {
-@@ -325,7 +326,6 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -314,6 +339,19 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+   const bool decode_has_skip_output = !exceeds_storage_buffer_limit && input_skip_bias_sum != nullptr;
+   Tensor* decode_input_skip_bias_sum = decode_has_skip_output ? input_skip_bias_sum : nullptr;
+ 
++  // The template that keeps a thread's part of A in registers, on the vendor it was measured on.
++  const bool registers =
++      context.AdapterInfo().vendor == std::string_view{"nvidia"} &&
++      decode_has_norm &&
++      !single_scale_weights &&
++      !acc_f32 &&
++      components_a == 4u &&
++      components_b == 4u &&
++      block_size == 32u;
++  if (registers) {
++    tile_size = 16;
++  }
++
+   uint32_t k_unroll_tiles = 1;
+   if ((K % tile_size_k) == 0) {
+     if (k_tile_iterations >= 8 && std::max(Nq, Nkv) <= 2048 &&
+@@ -325,7 +363,6 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
    }
  
    const uint32_t num_N_tile = CeilDiv(std::max(Nq, Nkv), tile_size);
@@ -505,21 +1024,23 @@ index 7137b6a..28be9d8 100644
    MatMulNBitsQkvDecodeProgram program{tile_size,
                                        single_scale_weights,
                                        tile_size_k_vec,
-@@ -333,7 +333,8 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -333,7 +370,9 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
                                        decode_has_norm,
                                        decode_has_skip_input,
                                        decode_has_skip_output,
 -                                      acc_f32};
 +                                      acc_f32,
-+                                      M};
++                                      M,
++                                      registers};
    program.SetWorkgroupSize(workgroup_size);
    program.SetDispatchGroupSize(num_N_tile, 1, batch_count);
    program
-@@ -376,6 +377,7 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+@@ -376,6 +415,8 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
                   decode_has_skip_input,
                   decode_has_skip_output,
                   acc_f32,
 +                 M,
++                 registers,
                   "decode_qkv_sln");
    if (decode_has_skip_output) {
      program.AddOutput({decode_input_skip_bias_sum,
@@ -836,3 +1357,289 @@ index a668259..ff65c85 100644
      }
    }
  }
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv_rows.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv_rows.wgsl.template
+new file mode 100644
+index 0000000..726eeb1
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv_rows.wgsl.template
+@@ -0,0 +1,187 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++// The fused 4-bit Q, K and V projections with each thread's part of A in registers. A thread takes the same
++// weight word of every column, which means it needs the same 32 elements of A for all of them. It holds those
++// for a whole k tile, and adds up a column's word across the k tiles itself, so the workgroup only shares the 32
++// partial sums of 4 columns at a time for the last step. Reads of workgroup memory are what this kernel waits on
++// once there is more than one row, and the less of it a workgroup holds, the more of them the GPU runs at once.
++//
++// The arithmetic for a row is that of matmul_nbits_qkv.wgsl.template in the same order, so a row comes out the
++// same from either.
++//
++// Fixed by the caller: 4-bit weights, block size 32, the norm in this kernel, A bound as vec4 and the weights as
++// vec4<u32>, and a workgroup of 128.
++
++#param has_skip_input
++#param has_skip_output
++#param rows
++#param tile_size
++
++#use .getByOffset .setByOffset
++
++var<workgroup> sum_squared_shared : array<f32, workgroup_size_x>;
++var<workgroup> tile_A : array<input_a_value_t, 256 * rows>;
++
++alias acc_element_t = q_output_element_t;
++// The 32 partial sums of 4 columns for every row.
++var<workgroup> q_partial : array<acc_element_t, 128 * rows>;
++var<workgroup> k_partial : array<acc_element_t, 128 * rows>;
++var<workgroup> v_partial : array<acc_element_t, 128 * rows>;
++
++const default_zero_point = vec4<q_output_element_t>(q_output_element_t(8));
++
++fn unpack_nibble_values(word: u32) -> vec4<q_output_element_t> {
++  let unpacked = unpack4xU8(word);
++  return vec4<q_output_element_t>(q_output_element_t(unpacked[0]),
++                                  q_output_element_t(unpacked[1]),
++                                  q_output_element_t(unpacked[2]),
++                                  q_output_element_t(unpacked[3]));
++}
++
++fn load_merged_input(input_offset: u32) -> input_a_value_t {
++  var value = a.getByOffset(input_offset);
++#if has_skip_input
++  let skip_offset = input_offset % (uniforms.skip_size / 4);
++  value += input_a_value_t(skip.getByOffset(skip_offset));
++#endif
++  return value;
++}
++
++// This thread's share of one k tile for one output column of one projection, as a sum per row.
++fn compute_projection_sums(weight: q_b_value_t,
++                           scale: q_output_element_t,
++                           mine: array<vec4<acc_element_t>, 8 * rows>) -> array<acc_element_t, rows> {
++  var sum : array<acc_element_t, rows>;
++  for (var i = 0u; i < 4; i++) {
++    let weight_lower = unpack_nibble_values(weight[i] & 0x0F0F0F0Fu) - default_zero_point;
++    let weight_upper = unpack_nibble_values((weight[i] >> 4) & 0x0F0F0F0Fu) - default_zero_point;
++    let w0 = vec4<q_output_element_t>(weight_lower[0], weight_upper[0], weight_lower[1], weight_upper[1]) * scale;
++    let w1 = vec4<q_output_element_t>(weight_lower[2], weight_upper[2], weight_lower[3], weight_upper[3]) * scale;
++    for (var r = 0u; r < rows; r++) {
++      sum[r] += dot(mine[r * 8 + i * 2], vec4<acc_element_t>(w0)) + dot(mine[r * 8 + i * 2 + 1], vec4<acc_element_t>(w1));
++    }
++  }
++  return sum;
++}
++
++$MAIN {
++  let batch = workgroup_idx / uniforms.num_N_tile;
++  let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_size;
++
++  let idx = local_idx % 32;
++  let idy = local_idx / 32;
++
++  var inv_std : array<f32, rows>;
++  for (var r = 0u; r < rows; r++) {
++    var sum_squared_local = 0.0;
++    for (var a_idx = local_idx; a_idx < uniforms.K_of_a; a_idx += workgroup_size_x) {
++      let a_f32 = vec4<f32>(load_merged_input((batch * rows + r) * uniforms.K_of_a + a_idx));
++      sum_squared_local += dot(a_f32, a_f32);
++    }
++    sum_squared_shared[local_idx] = sum_squared_local;
++    workgroupBarrier();
++
++    var reduce_size : u32 = workgroup_size_x;
++    for (var curr_size = reduce_size >> 1; curr_size > 0; curr_size = reduce_size >> 1) {
++      reduce_size = curr_size + (reduce_size & 1u);
++      if (local_idx < curr_size) {
++        sum_squared_shared[local_idx] += sum_squared_shared[local_idx + reduce_size];
++      }
++      workgroupBarrier();
++    }
++
++    inv_std[r] = inverseSqrt(sum_squared_shared[0] / f32(uniforms.K) + uniforms.epsilon);
++    // Every thread has to read the total before the next row's sums overwrite it.
++    workgroupBarrier();
++  }
++
++  // One sum for each group of 4 columns and each row.
++  var q_sums : array<acc_element_t, (tile_size / 4) * rows>;
++  var k_sums : array<acc_element_t, (tile_size / 4) * rows>;
++  var v_sums : array<acc_element_t, (tile_size / 4) * rows>;
++  for (var kidx = 0u; kidx < uniforms.K; kidx += 1024) {
++    for (var r = 0u; r < rows; r++) {
++      for (var id = local_idx; id < 256; id += workgroup_size_x) {
++        let a_offset = kidx / 4 + id;
++        let input_offset = (batch * rows + r) * uniforms.K_of_a + a_offset;
++        if (a_offset < uniforms.K_of_a) {
++          let merged_value = load_merged_input(input_offset);
++#if has_skip_output
++          if (b_global_base == 0u) {
++            input_skip_bias_sum.setByOffset(input_offset, input_skip_bias_sum_value_t(merged_value));
++          }
++#endif
++          tile_A[r * 256 + id] = merged_value * input_a_value_t(input_a_element_t(inv_std[r])) * norm_scale.getByOffset(a_offset);
++        } else {
++          tile_A[r * 256 + id] = input_a_value_t(0);
++        }
++      }
++    }
++    workgroupBarrier();
++
++    var mine : array<vec4<acc_element_t>, 8 * rows>;
++    for (var n = 0u; n < 8 * rows; n++) {
++      mine[n] = vec4<acc_element_t>(tile_A[(n / 8) * 256 + idx * 8 + n % 8]);
++    }
++    let k_offset = kidx / 32 + idx;
++    let block_idx = (kidx + idx * 32) / uniforms.block_size;
++    if (k_offset < uniforms.K_of_b) {
++      for (var phase = 0u; phase < tile_size / 4; phase++) {
++        let b_global = b_global_base + phase * 4 + idy;
++        if (b_global < uniforms.Nq) {
++          let q_scale_b = q_output_element_t(q_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
++          let q_weight = q_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
++          let sums = compute_projection_sums(q_weight, q_scale_b, mine);
++          for (var r = 0u; r < rows; r++) {
++            q_sums[phase * rows + r] += sums[r];
++          }
++        }
++        if (b_global < uniforms.Nkv) {
++          let k_scale_b = q_output_element_t(k_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
++          let v_scale_b = q_output_element_t(v_scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx));
++          let k_weight = k_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
++          let v_weight = v_b.getByOffset(b_global * uniforms.K_of_b + k_offset);
++          let sums_k = compute_projection_sums(k_weight, k_scale_b, mine);
++          let sums_v = compute_projection_sums(v_weight, v_scale_b, mine);
++          for (var r = 0u; r < rows; r++) {
++            k_sums[phase * rows + r] += sums_k[r];
++            v_sums[phase * rows + r] += sums_v[r];
++          }
++        }
++      }
++    }
++    // The next k tile writes over tile_A.
++    workgroupBarrier();
++  }
++
++  for (var phase = 0u; phase < tile_size / 4; phase++) {
++    for (var r = 0u; r < rows; r++) {
++      q_partial[(idy * rows + r) * 32 + idx] = q_sums[phase * rows + r];
++      k_partial[(idy * rows + r) * 32 + idx] = k_sums[phase * rows + r];
++      v_partial[(idy * rows + r) * 32 + idx] = v_sums[phase * rows + r];
++    }
++    workgroupBarrier();
++    if (local_idx < 4 * rows) {
++      let b_global = b_global_base + phase * 4 + local_idx / rows;
++      var q_output_value = acc_element_t(0);
++      var k_output_value = acc_element_t(0);
++      var v_output_value = acc_element_t(0);
++      for (var b = 0u; b < 32; b++) {
++        q_output_value += q_partial[local_idx * 32 + b];
++        k_output_value += k_partial[local_idx * 32 + b];
++        v_output_value += v_partial[local_idx * 32 + b];
++      }
++      let row = batch * rows + local_idx % rows;
++      if (b_global < uniforms.Nq) {
++        q_output.setByOffset(row * uniforms.Nq + b_global, q_output_value_t(q_output_value));
++      }
++      if (b_global < uniforms.Nkv) {
++        k_output.setByOffset(row * uniforms.Nkv + b_global, k_output_value_t(k_output_value));
++        v_output.setByOffset(row * uniforms.Nkv + b_global, v_output_value_t(v_output_value));
++      }
++    }
++    // The next 4 columns write over the partial sums.
++    workgroupBarrier();
++  }
++}  // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_rows.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_rows.wgsl.template
+new file mode 100644
+index 0000000..b6474c5
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_rows.wgsl.template
+@@ -0,0 +1,87 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++// The 4-bit matmul for a few rows of A, with every row in one workgroup so the weights are read once for all of
++// them. A thread takes the same weight word of every column, which means it needs the same 32 elements of A for
++// all of them, and it holds those in registers for a whole k tile. Reads of workgroup memory are what this
++// kernel waits on once there is more than one row.
++//
++// The arithmetic for a row is that of matmul_nbits.wgsl.template in the same order, so a row comes out the same
++// from either.
++//
++// Fixed by the caller: 4-bit weights with the default zero point, block size 32, A bound as vec4 and the weights
++// as vec4<u32>, and a workgroup of 128.
++
++#param rows
++#param tile_size
++
++#use .getByOffset .setByOffset
++
++var<workgroup> tile_A : array<input_a_value_t, 256 * rows>;
++var<workgroup> inter_results : array<array<output_element_t, 32>, tile_size * rows>;
++
++$MAIN {
++  let batch = workgroup_idx / uniforms.num_N_tile;
++  let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_size;
++  let idx = local_idx % 32;
++  let idy = local_idx / 32;
++
++  for (var kidx = 0u; kidx < uniforms.K; kidx += 1024) {
++    for (var r = 0u; r < rows; r++) {
++      for (var id = local_idx; id < 256; id += workgroup_size_x) {
++        let a_offset = kidx / 4 + id;
++        if (batch < uniforms.batch_count && a_offset < uniforms.K_of_a) {
++          tile_A[r * 256 + id] = a.getByOffset((batch * rows + r) * uniforms.K_of_a + a_offset);
++        } else {
++          tile_A[r * 256 + id] = input_a_value_t(0);
++        }
++      }
++    }
++    workgroupBarrier();
++
++    var mine : array<vec4<output_element_t>, 8 * rows>;
++    for (var n = 0u; n < 8 * rows; n++) {
++      mine[n] = vec4<output_element_t>(tile_A[(n / 8) * 256 + idx * 8 + n % 8]);
++    }
++    for (var local_row_offset = 0u; local_row_offset < tile_size; local_row_offset += 4) {
++      let b_global = b_global_base + local_row_offset + idy;
++      let k_offset = kidx / 32 + idx;
++      if (b_global < uniforms.N && k_offset < uniforms.K_of_b) {
++        let block_idx = (kidx + idx * 32) / uniforms.block_size;
++        let scale_b = scales_b.getByOffset(b_global * uniforms.blocks_per_col + block_idx);
++        let b_value = b.getByOffset(b_global * uniforms.K_of_b + k_offset);
++
++        var sum : array<output_element_t, rows>;
++        for (var i = 0u; i < 4; i++) {
++          let b_value_lower = vec4<output_element_t>(unpack4xU8(b_value[i] & 0x0F0F0F0Fu)) - vec4<output_element_t>(8);
++          let b_value_upper = vec4<output_element_t>(unpack4xU8((b_value[i] >> 4) & 0x0F0F0F0Fu)) - vec4<output_element_t>(8);
++          let b0 = vec4<output_element_t>(b_value_lower[0], b_value_upper[0], b_value_lower[1], b_value_upper[1]) * scale_b;
++          let b1 = vec4<output_element_t>(b_value_lower[2], b_value_upper[2], b_value_lower[3], b_value_upper[3]) * scale_b;
++          for (var r = 0u; r < rows; r++) {
++            sum[r] += dot(mine[r * 8 + i * 2], b0) + dot(mine[r * 8 + i * 2 + 1], b1);
++          }
++        }
++        for (var r = 0u; r < rows; r++) {
++          inter_results[(local_row_offset + idy) * rows + r][idx] += sum[r];
++        }
++      }
++    }
++    workgroupBarrier();
++  }
++
++  if (batch >= uniforms.batch_count) {
++    return;
++  }
++
++  // tile_size * rows is at most the workgroup size, so every column and row has a thread.
++  if (local_idx < tile_size * rows) {
++    let b_global = b_global_base + local_idx / rows;
++    var output_value = output_element_t(0);
++    for (var b = 0u; b < 32; b++) {
++      output_value += inter_results[local_idx][b];
++    }
++    if (b_global < uniforms.N) {
++      output.setByOffset((batch * rows + local_idx % rows) * uniforms.N + b_global, output_value);
++    }
++  }
++}  // MAIN

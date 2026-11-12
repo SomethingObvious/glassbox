@@ -6,6 +6,8 @@ Stock 1.31.1 only runs its fused 4-bit kernels (the MLP's gate and up, and atten
 
 Its attention also picks a different shader for a pass of two or three rows than for one, and that shader adds the same products up in another order. The rows came out a little different from the same rows read one at a time (by up to 0.16 in a logit), which was enough for the run with guesses to pick another token where two were nearly tied. The patch uses the one-row shader up to three rows, so those rows are now the same bits, and the three-row pass went from 14.9 ms to 14.6 ms.
 
+A pass with three rows still took half as long again as a pass with one, mostly because the 4-bit kernels wait on workgroup memory. A thread in those kernels takes the same weight word of every output column, so it needs the same 32 values of the input for all of them, and the stock kernels read those from workgroup memory again for every 4 columns. The patch has a thread keep them in registers for 16 columns, in the fused q, k and v kernel and in a new kernel that takes 2 or 3 rows through the plain 4-bit matmul together (it adds up in stock's order, so a row comes out the same bits). The fused MLP kernel gets a version that reads its input once for 60 columns and adds up in f32. These only run on NVIDIA GPUs, which is where I could measure them, and they took the three-row pass from 14.6 ms to 11.2 ms, with a one-row pass still about 9.2 ms.
+
 To build it, check out v1.31.1 with its submodules, apply the patch and run what onnxruntime's web CI runs.
 
 ```
