@@ -1,9 +1,10 @@
 """Figure 1's live run as two ONNX graphs built on the 4-bit Qwen3-1.7B the page already ran.
 
-Both keep their weights in the file Exempliss hosts and are made for WebGPU graph capture, where a pass is replayed
-from recorded GPU commands. That needs fixed shapes and every input on the GPU, so the attention mask is swapped for
-the two numbers attention reads from it, and the KV cache is one fixed buffer per layer that a pass writes its new
-rows into. A guess the big model turns down needs no cleanup, as the next pass writes over its row.
+Both keep their weights in the file Exempliss hosts, apart from a 4-bit copy of the LM head that goes in beside the
+EAGLE head's. They are made for WebGPU graph capture, where a pass is replayed from recorded GPU commands. That
+needs fixed shapes and every input on the GPU, so the attention mask is swapped for the two numbers attention reads
+from it, and the KV cache is one fixed buffer per layer that a pass writes its new rows into. A guess the big model
+turns down needs no cleanup, as the next pass writes over its row.
 
 The big graph writes alone, one token a pass. The pass graph checks two guesses and runs the EAGLE-3 head right after
 the big model on what it read, so it guesses after every row in the same call. It also works out which rows the
@@ -33,14 +34,19 @@ DRAFT = Path(__file__).resolve().parent.parent / "docs" / "data" / "draft.json"
 ROWS = 3  # the pass graph's rows: the last token and two guesses
 ENTRIES = 1024  # the length of the CPU check's cache buffers
 BLOCK = 16  # both vocabularies divide by it, and under 32 WebGPU gives the first step a thread for every block
+STRETCH = 128  # the 4-bit copy of the LM head ranks the vocabulary in stretches of this many tokens
+BEST = 8  # and this many stretches are scored again from the fp16 table
 
 
-def first_max(x: str, out: str, size: int) -> tuple[list["onnx.NodeProto"], list["onnx.TensorProto"]]:
+def first_max(
+    x: str, out: str, size: int, ids: str = "", past: int = 0
+) -> tuple[list["onnx.NodeProto"], list["onnx.TensorProto"]]:
     """Nodes and constants that put the index of the first largest of `size` values along the last axis in `out`.
 
     That is ArgMax, which onnxruntime's WebGPU provider runs as one shader thread walking the whole vocabulary, and
     it was 8.7 ms of a 20 ms pass. Both reductions here go in two steps, as one step over the whole axis gets a
-    single small workgroup for each row.
+    single small workgroup for each row. With `ids` (floats under `past`, shaped like `x`) the values are those
+    tokens' and `out` is the lowest id among the largest.
     """
     import numpy as np
     from onnx import TensorProto, helper, numpy_helper
@@ -49,7 +55,7 @@ def first_max(x: str, out: str, size: int) -> tuple[list["onnx.NodeProto"], list
     consts = [
         numpy_helper.from_array(np.float32(0), f"{out}/zero"),
         numpy_helper.from_array(np.float32(1), f"{out}/one"),
-        numpy_helper.from_array(np.float32(size), f"{out}/past"),
+        numpy_helper.from_array(np.float32(past or size), f"{out}/past"),
         numpy_helper.from_array(np.array([0, 0, size // BLOCK, BLOCK], np.int64), f"{out}/blocks"),
     ]
 
@@ -65,22 +71,94 @@ def first_max(x: str, out: str, size: int) -> tuple[list["onnx.NodeProto"], list
         ]
 
     nodes = [
-        node("Range", [f"{out}/zero", f"{out}/past", f"{out}/one"], f"{out}/ramp"),
+        *([] if ids else [node("Range", [f"{out}/zero", f"{out}/past", f"{out}/one"], f"{out}/ramp")]),
         *reduced("ReduceMax", x, f"{out}/top", 1),
         node("Equal", [x, f"{out}/top"], f"{out}/is_top"),
         # Every place that holds the largest value keeps its index, and the rest get one past the end.
-        node("Where", [f"{out}/is_top", f"{out}/ramp", f"{out}/past"], f"{out}/places"),
+        node("Where", [f"{out}/is_top", ids or f"{out}/ramp", f"{out}/past"], f"{out}/places"),
         *reduced("ReduceMin", f"{out}/places", f"{out}/first", 0),
         node("Cast", [f"{out}/first"], out, to=TensorProto.INT64),
     ]
     return nodes, consts
 
 
-def big(model: "onnx.ModelProto", reads: bool = False) -> None:
+def rough(table: "np.ndarray") -> "onnx.ModelProto":
+    """The LM head, which is the embedding `table` on its side, as one 4-bit MatMulNBits from `x` to `lm/rough`."""
+    import numpy as np
+    from onnx import TensorProto, helper, numpy_helper
+    from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+
+    vocab, width = table.shape
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["x", "lm_head.weight"], ["lm/rough"], name="lm/rough")],
+        "lm_head",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT16, [1, "rows", width])],
+        [helper.make_tensor_value_info("lm/rough", TensorProto.FLOAT16, [1, "rows", vocab])],
+        [numpy_helper.from_array(np.ascontiguousarray(table.T), "lm_head.weight")],
+    )
+    opsets = [helper.make_opsetid("", 14), helper.make_opsetid("com.microsoft", 1)]
+    quantizer = MatMulNBitsQuantizer(
+        helper.make_model(graph, opset_imports=opsets, ir_version=7), bits=4, block_size=32, is_symmetric=True
+    )
+    quantizer.process()
+    return quantizer.model.model
+
+
+def shortlist(x: str, scan: "onnx.NodeProto", vocab: int) -> tuple[list["onnx.NodeProto"], list["onnx.TensorProto"]]:
+    """Nodes that put fp16 logits for the `BEST * STRETCH` likeliest tokens after `x` in `logits_fp16`.
+
+    The whole fp16 table is 622 MB, and reading it was 3.7 ms of a 9 ms pass. `scan` is a 4-bit copy that scores
+    every token, the vocabulary is ranked in stretches by the best token in each, and only the tokens of the best
+    stretches are scored from the fp16 table. Their ids come out in `choices`, as floats.
+
+    Both are also flattened inside the graph, as `lm/logits` and `lm/choices`. A graph's output has to come out of
+    a kernel, since a Reshape into an output buffer is a copy that WebGPU graph capture does not replay.
+    """
+    import numpy as np
+    from onnx import TensorProto, helper, numpy_helper
+
+    assert vocab % STRETCH == 0, f"{vocab} tokens do not split into stretches of {STRETCH}"
+    assert (BEST * STRETCH) % BLOCK == 0, f"{BEST * STRETCH} choices do not split into blocks of {BLOCK}"
+    consts = [
+        numpy_helper.from_array(np.array([0, 0, vocab // STRETCH, STRETCH], np.int64), "lm/stretches"),
+        numpy_helper.from_array(np.array([BEST], np.int64), "lm/best"),
+        numpy_helper.from_array(np.float32(STRETCH), "lm/stretch"),
+        numpy_helper.from_array(np.array([0, 0, BEST, 1], np.int64), "lm/column_of_starts"),
+        numpy_helper.from_array(np.arange(STRETCH, dtype=np.float32), "lm/ramp"),
+        numpy_helper.from_array(np.array([0, 0, BEST * STRETCH], np.int64), "lm/flat"),
+        numpy_helper.from_array(np.array([0, 0, -1, 1], np.int64), "lm/column"),
+    ]
+
+    def node(kind: str, inputs: list[str], name: str, **attrs: object) -> "onnx.NodeProto":
+        return helper.make_node(kind, inputs, [name], name=name, **attrs)
+
+    scan.input[0] = x
+    table = "model.embed_tokens.weight"
+    nodes = [
+        scan,
+        node("Reshape", ["lm/rough", "lm/stretches"], "lm/rough_stretches"),
+        node("ReduceMax", ["lm/rough_stretches"], "lm/stretch_best", axes=[-1], keepdims=0),
+        helper.make_node("TopK", ["lm/stretch_best", "lm/best"], ["lm/best_value", "lm/best_at"], name="lm/best_at"),
+        node("Cast", ["lm/best_at"], "lm/best_at_float", to=TensorProto.FLOAT),
+        node("Mul", ["lm/best_at_float", "lm/stretch"], "lm/starts"),
+        node("Reshape", ["lm/starts", "lm/column_of_starts"], "lm/starts_column"),
+        node("Add", ["lm/starts_column", "lm/ramp"], "choices"),
+        node("Reshape", ["choices", "lm/flat"], "lm/choices"),
+        node("Cast", ["lm/choices"], "lm/choice_ids", to=TensorProto.INT64),
+        node("Gather", [table, "lm/choice_ids"], "lm/rows"),
+        node("Reshape", [x, "lm/column"], "lm/x_column"),
+        node("MatMul", ["lm/rows", "lm/x_column"], "logits_fp16"),
+        node("Reshape", ["logits_fp16", "lm/flat"], "lm/logits"),
+    ]
+    return nodes, consts
+
+
+def big(model: "onnx.ModelProto", scan: "onnx.ModelProto", reads: bool = False) -> None:
     """Gives the hosted graph `seqlens` and `total` inputs in place of the mask, and a `wants` output.
 
-    `seqlens` is the position of the last row and `total` one past it. With `reads` it also hands out what the head
-    reads, and `next_ids` where `given` is set stand in for the big model's picks as the token after each row.
+    `seqlens` is the position of the last row and `total` one past it. `scan` is the LM head in 4 bits, from
+    `rough`. With `reads` it also hands out what the head reads, and `next_ids` where `given` is set stand in for
+    the big model's picks as the token after each row.
     """
     from onnx import TensorProto, helper
 
@@ -90,14 +168,17 @@ def big(model: "onnx.ModelProto", reads: bool = False) -> None:
     for node in g.node:
         if node.op_type == "GroupQueryAttention":
             node.input[5], node.input[6] = "seqlens", "total"
-    kept = [n for n in g.node if n not in mask and not (n.op_type == "Cast" and n.output[0] == "logits")]
+    whole = next(n for n in g.node if n.output[0] == "logits_fp16")
+    drop = [*mask, whole, *[n for n in g.node if n.output[0] == whole.input[1]]]
+    kept = [n for n in g.node if n not in drop and not (n.op_type == "Cast" and n.output[0] == "logits")]
     assert not any(x in gone or x == "attention_mask" for n in kept for x in n.input), "the mask feeds more than GQA"
     del g.node[:]
     g.node.extend(kept)
     vocab = next(i.dims[0] for i in g.initializer if i.name == "model.embed_tokens.weight")
-    nodes, consts = first_max("logits_fp16", "wants", vocab)
-    g.node.extend(nodes)
-    g.initializer.extend(consts)
+    listed, list_consts = shortlist(whole.input[0], scan.graph.node[0], vocab)
+    nodes, consts = first_max("lm/logits", "wants", BEST * STRETCH, "lm/choices", vocab)
+    g.node.extend([*listed, *nodes])
+    g.initializer.extend([*scan.graph.initializer, *list_consts, *consts])
     inputs = [i for i in g.input if i.name != "attention_mask"]
     del g.input[:]
     g.input.extend(inputs)
@@ -114,7 +195,8 @@ def big(model: "onnx.ModelProto", reads: bool = False) -> None:
     g.output.extend(outputs)
     g.output.extend(
         [
-            helper.make_tensor_value_info("logits_fp16", TensorProto.FLOAT16, [*shape, "vocab"]),
+            helper.make_tensor_value_info("logits_fp16", TensorProto.FLOAT16, [*shape, BEST * STRETCH, 1]),
+            helper.make_tensor_value_info("choices", TensorProto.FLOAT, [*shape, BEST, STRETCH]),
             helper.make_tensor_value_info("wants", TensorProto.INT64, shape),
         ]
     )
@@ -251,7 +333,7 @@ def joined(model: "onnx.ModelProto", step: "onnx.ModelProto") -> None:
         node.input[:] = [wired.get(x) or renamed.get(x) or (x and f"head/{x}") for x in node.input]
         node.output[:] = [renamed.get(x) or f"head/{x}" for x in node.output]
         g.node.append(node)
-    outputs = [o for o in g.output if o.name not in {"logits_fp16", "states", "follow"}]
+    outputs = [o for o in g.output if o.name not in {"logits_fp16", "choices", "states", "follow"}]
     del g.output[:]
     g.output.extend(outputs)
     cache = [1, 8, "head_entries", 128]
@@ -457,29 +539,44 @@ def export(out: Path) -> None:
     """Writes big.onnx, pass.onnx and head.onnx.data to `out`/onnx, then writes draft.json's prompt both ways with them.
 
     The hosted weights are downloaded into the same folder, since both graphs read them from beside themselves.
+    The 4-bit LM head goes to scan.data there, which is not uploaded, as the page makes the same bytes from the
+    hosted weights (docs/js/scan.js).
     """
     import copy
 
+    import numpy as np
     import onnx
     import onnxruntime as ort
     from huggingface_hub import hf_hub_download
+    from onnx.external_data_helper import set_external_data
     from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
     from safetensors.numpy import load_file
     from transformers import AutoTokenizer
 
     hosted = Path(hf_hub_download(**BIG, filename="onnx/model_q4f16.onnx_data", local_dir=out))
     graph = onnx.load(hf_hub_download(**BIG, filename="onnx/model_q4f16.onnx"), load_external_data=False)
-    files = [hosted.with_name(name) for name in ("big.onnx", "pass.onnx", "head.onnx.data")]
+    files = [hosted.with_name(name) for name in ("big.onnx", "pass.onnx", "head.onnx.data", "scan.data")]
     alone_graph = copy.deepcopy(graph)
-    big(alone_graph)
-    onnx.save(alone_graph, str(files[0]))
-    big(graph, reads=True)
+    table = next(i for i in graph.graph.initializer if i.name == "model.embed_tokens.weight")
+    at = int(next(e.value for e in table.external_data if e.key == "offset"))
+    assert at == 0, f"the page takes the embedding table from the start of the weights, and it is at {at}"
+    scan = rough(np.fromfile(hosted, np.float16, count=int(np.prod(table.dims)), offset=at).reshape(table.dims))
+    held = {i.name: i for i in scan.graph.initializer}
+    with files[3].open("wb") as data:
+        for name in scan.graph.node[0].input[1:]:
+            raw = held[name].raw_data
+            set_external_data(held[name], files[3].name, data.tell(), len(raw))
+            held[name].ClearField("raw_data")
+            data.write(raw)
+    big(graph, copy.deepcopy(scan), reads=True)
     quantizer = MatMulNBitsQuantizer(head(load_file(hf_hub_download(**HEAD))), bits=4, block_size=32, is_symmetric=True)
     quantizer.process()
     joined(graph, quantizer.model.model)
     chained(graph)
     files[2].unlink(missing_ok=True)  # onnx will not write over an old one
     onnx.save(graph, str(files[1]), save_as_external_data=True, location=files[2].name)
+    big(alone_graph, scan)
+    onnx.save(alone_graph, str(files[0]))
 
     run = [ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]) for path in files[:2]]
     tok = AutoTokenizer.from_pretrained(TARGET)
@@ -495,7 +592,7 @@ def export(out: Path) -> None:
     passes = guessed(run[1], prompt, MOST, stop)
     ours = [t for guesses, kept, own in passes for t in [*guesses[:kept], own]]
     same = alone(run[0], prompt, len(ours)) == ours
-    size = sum(path.stat().st_size for path in files) / 1e6
+    size = sum(path.stat().st_size for path in files[:3]) / 1e6
     print(
         f"{files[0].parent}: {size:.0f} MB. {len(ours)} tokens in {len(passes)} passes at {ROWS - 1} guesses each, "
         f"{len(ours) / len(passes):.2f} a pass, and {'the same text' if same else 'not the same text'} as alone"

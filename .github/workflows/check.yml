@@ -16,7 +16,7 @@ jobs:
       - run: uv run --group dev pytest -q
       # The banners in assets/ must match what the saved traces draw.
       - run: |
-          for banner in route draft waves; do uv run python -m switchboard "$banner"; done
+          for banner in route draft; do uv run python -m switchboard "$banner"; done
           git diff --exit-code assets
 
   web:

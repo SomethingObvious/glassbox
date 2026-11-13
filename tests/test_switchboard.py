@@ -1,25 +1,14 @@
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from switchboard import draft, quant, route, spell, waves
+from switchboard import draft, quant, route, spell
 from switchboard.svg import Timeline
 
 DATA = Path(__file__).resolve().parent.parent / "docs" / "data"
-
-
-@pytest.mark.parametrize(
-    ("plan", "tiles", "count", "last"),
-    [
-        (waves.Plan(m=512, n=14336, tile=128, sms=132), 448, 4, 52),
-        (waves.Plan(m=128, n=132 * 128, tile=128, sms=132), 132, 1, 132),
-        (waves.Plan(m=100, n=100, tile=128, sms=132), 1, 1, 1),
-    ],
-)
-def test_waves_count_partial_tiles_and_the_last_wave(plan, tiles, count, last):
-    assert (plan.tiles, plan.waves, plan.busy(plan.waves - 1)) == (tiles, count, last)
-    assert plan.efficiency == tiles / (count * plan.sms)
 
 
 @pytest.mark.parametrize(
@@ -109,3 +98,31 @@ def test_lens_trace_has_every_layer_at_every_position_likeliest_first():
             for top in layer:
                 probs = [p for _, p in top]
                 assert probs == sorted(probs, reverse=True) and sum(probs) <= 1.0001
+
+
+def test_the_page_quantizes_the_lm_head_as_onnxruntime_does(tmp_path):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("onnxruntime")
+    if not shutil.which("node"):
+        pytest.skip("needs node to run docs/js/scan.js")
+    from switchboard import head
+
+    # Rows of very small weights and a row of zeros, where a scale is too small for fp16 to hold.
+    rng = np.random.default_rng(0)
+    table = (rng.standard_normal((96, 64)) * rng.choice([1e-7, 1e-5, 0.02, 3.0], (96, 1))).astype(np.float16)
+    table[5] = 0
+    model = head.rough(table)
+    held = {i.name: i.raw_data for i in model.graph.initializer}
+    want = b"".join(held[name] for name in model.graph.node[0].input[1:])
+    (tmp_path / "table").write_bytes(table.tobytes())
+    script = f"""
+        import {{ scan }} from {(DATA.parent / "js/scan.js").as_uri()!r}
+        import {{ readFileSync }} from "node:fs"
+        const bytes = readFileSync("table")
+        const table = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.length / 2)
+        process.stdout.write(Buffer.from(await scan(table, 64)).toString("hex"))
+    """
+    got = subprocess.run(
+        ["node", "--input-type=module", "-e", script], cwd=tmp_path, capture_output=True, text=True, check=True
+    )
+    assert bytes.fromhex(got.stdout) == want

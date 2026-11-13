@@ -218,8 +218,12 @@ def render(t: Trace) -> str:
             hidden.append(tl.show(f"w{si}_{j}", settle, end, out=OUT))
             shown_at.setdefault(spot.y, settle)
             own = j == s["kept"]
+            # The rule goes under the word and not the space before it.
+            indent = spot.width * (1 - len(spot.text.lstrip()) / max(len(spot.text), 1))
             mark = (
-                line(spot.x, spot.y + 7, spot.x + spot.width, spot.y + 7, INK, 3) if own and spot.text.strip() else ""
+                line(spot.x + indent, spot.y + 7, spot.x + spot.width, spot.y + 7, INK, 3)
+                if own and spot.text.strip()
+                else ""
             )
             word = text(spot.x, spot.y, spot.text, 20, INK, font=MONO, weight=700 if own else 400, fit=spot.width)
             body.append(f'<g class="{hidden[-1]}">{word}{mark}</g>')

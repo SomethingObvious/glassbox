@@ -1,9 +1,9 @@
-"""Command line: `python -m switchboard {route,draft,waves}` redraws a banner, `--trace` reruns its model first.
+"""Command line: `python -m switchboard {route,draft}` redraws a banner, `--trace` reruns its model first.
 
 `--headline` runs route or draft on today's top Hacker News title. Draft takes the title from the route.json
 that route wrote beside it, so both figures show the same story.
 
-`python -m switchboard quant` and `lens` run Qwen3-0.6B for Figures 4 and 5, which have no banners. `routes`
+`python -m switchboard quant` and `lens` run Qwen3-0.6B for Figures 3 and 4, which have no banners. `routes`
 exports the model Figure 2 runs in the browser to build/routes, and `head` exports Figure 1's to build/head.
 """
 
@@ -12,7 +12,7 @@ import datetime
 import json
 from pathlib import Path
 
-from . import draft, head, lens, quant, route, routes, waves
+from . import draft, head, lens, quant, route, routes
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA, ASSETS = ROOT / "docs" / "data", ROOT / "assets"
@@ -26,7 +26,7 @@ def save(path: Path, svg: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="switchboard", description=__doc__)
-    parser.add_argument("banner", choices=["route", "draft", "waves", "quant", "lens", "routes", "head"])
+    parser.add_argument("banner", choices=["route", "draft", "quant", "lens", "routes", "head"])
     parser.add_argument("--trace", action="store_true", help="run the model again instead of reading the saved trace")
     parser.add_argument("--headline", type=Path, metavar="SVG", help="draw today's top Hacker News title here")
     args = parser.parse_args()
@@ -41,8 +41,6 @@ def main() -> None:
     elif args.banner in {"quant", "lens"}:
         module = {"quant": quant, "lens": lens}[args.banner]
         (DATA / f"{args.banner}.json").write_text(json.dumps(module.trace()), encoding="utf-8")
-    elif args.banner == "waves":
-        save(ASSETS / "waves.svg", waves.render())
     elif args.headline and args.banner == "draft":
         routed = args.headline.with_name("route.json")
         if routed.exists():

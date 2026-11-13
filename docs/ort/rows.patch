@@ -13,7 +13,7 @@ index addf128..7e7ebfe 100644
    m_tile = SelectDecodeMTile(
        m_tile, tile_size, head_size_vec, Q->DataType()->Size(), kv_cache_quantization_bits,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 959bb0a..d100f3c 100644
+index 959bb0a..9a699bd 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -114,6 +114,20 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
@@ -37,19 +37,20 @@ index 959bb0a..d100f3c 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -339,6 +353,38 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -339,6 +353,39 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    constexpr uint32_t kU32Components = 4;
    uint32_t components_b_with_u32 = components_b * kU32Components;
    uint32_t K_of_b = (n_blocks_per_col * blob_size) / components_b_with_u32;
 +
 +  // 2 or 3 rows go through one set of workgroups that reads the weights once for all of them, where the
-+  // program below gives every row workgroups of its own. Only on the vendor it was measured on.
++  // program below gives every row workgroups of its own. Not on Intel, where that program adds up in k tiles of
++  // another size, so a row would not come out the same from both.
 +  const bool use_rows_program =
 +      M >= 2u && M <= 3u && !broadcast_a &&
 +      nbits == 4 && block_size == 32u &&
 +      !has_zero_points && !has_bias && !has_weight_idx && !acc_f32 &&
 +      components_a == 4u && components_b == 4u &&
-+      context.AdapterInfo().vendor == std::string_view{"nvidia"};
++      context.AdapterInfo().vendor != std::string_view{"intel"};
 +  if (use_rows_program) {
 +    constexpr uint32_t rows_tile_size = 16;
 +    const uint32_t rows_num_N_tile = (N + rows_tile_size - 1) / rows_tile_size;
@@ -1643,3 +1644,36 @@ index 0000000..b6474c5
 +    }
 +  }
 +}  // MAIN
+diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+index fbad41c..a9e08d3 100644
+--- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+@@ -112,6 +112,28 @@ Status LayerNormProgram::GenerateShaderCode(ShaderHelper& shader) const {
+         << "var<workgroup> sum_shared : array<f32_val_t, workgroup_size_x>;\n"
+         << "var<workgroup> sum_squared_shared : array<f32_val_t, workgroup_size_x>;\n";
+ 
++    if (simplified_ && !has_bias_ && !has_mean_output_ && !has_inv_std_dev_output_ && !fp32_normalization_) {
++      // A norm with fewer vectors than the workgroup has threads (128 values a head in a q_norm, say) goes whole to
++      // the last thread below, and the other threads only wait at the barriers of the reduction. Here every thread
++      // adds up the norm itself, in that same order, and writes one vector.
++      shader.MainFunctionBody()
++          << "let short_norm = uniforms.norm_size / uniforms.components;\n"
++          << "if (short_norm < workgroup_size_x) {\n"
++          << "  if (local_idx < short_norm) {\n"
++          << "    let base = workgroup_idx * short_norm;\n"
++          << "    var square_sum = f32_val_t(0);\n"
++          << "    for (var i: u32 = 0; i < short_norm; i++) {\n"
++          << "      let f32_value = f32_val_t(" << x.GetByOffset("base + i") << ");\n"
++          << "      square_sum += f32_value * f32_value;\n"
++          << "    }\n"
++          << "    let inv_std_dev = inverseSqrt(" << SumVector("square_sum", components) << " / f32(uniforms.norm_size) + uniforms.epsilon);\n"
++          << "    let output_value = " << output_expression(x.GetByOffset("base + local_idx"), "local_idx") << ";\n"
++          << "    " << y.SetByOffset("base + local_idx", "output_value") << "\n"
++          << "  }\n"
++          << "  return;\n"
++          << "}\n";
++    }
++
+     shader.MainFunctionBody()
+         << "let ix = local_idx;\n"
+         << "let iy = workgroup_idx;\n"

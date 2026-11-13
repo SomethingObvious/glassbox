@@ -2,7 +2,7 @@ import { $, calm, json, svg } from "./dom.js";
 import { LIBRARY, pieces, readable } from "./tokens.js";
 import { cached, runtime } from "./weights.js";
 
-const state = { trace: null, run: 0, current: 0, playing: true, whole: false, cells: [], shown: [] };
+const state = { trace: null, run: 0, current: 0, playing: true, whole: false, seen: false, cells: [], shown: [] };
 const MONO = { class: "g-label" };
 
 function drawGrid(experts, layers) {
@@ -24,14 +24,15 @@ function drawGrid(experts, layers) {
     state.cells.push(
       Array.from({ length: experts }, (_, e) => {
         const x = left + e * cw;
-        const cell = svg("g", {}, grid);
+        const cell = svg("g", { style: `--l: ${l}` }, grid);
         const box = { x, y, width: cw - 3, height: ch - 3 };
         svg("rect", { ...box, class: "g-cell" }, cell);
-        const heat = svg("rect", { ...box, class: "g-heat", "fill-opacity": 0.03 }, cell);
-        const pick = svg("rect", { ...box, class: "g-pick", opacity: 0 }, cell);
+        // These are styles and not attributes, so that the stylesheet's transitions run when they change.
+        const heat = svg("rect", { ...box, class: "g-heat", style: "fill-opacity: 0.03" }, cell);
+        const pick = svg("rect", { ...box, class: "g-pick", style: "opacity: 0" }, cell);
         const ring = svg(
           "circle",
-          { cx: x + (cw - 3) / 2, cy: y + (ch - 3) / 2, r: 3, class: "g-ring", opacity: 0 },
+          { cx: x + (cw - 3) / 2, cy: y + (ch - 3) / 2, r: 3, class: "g-ring", style: "opacity: 0" },
           cell,
         );
         cell.addEventListener("pointerenter", (event) => tooltip(event, l, e));
@@ -114,7 +115,7 @@ function pickRun(index) {
   const peak = Math.max(...use.flat());
   use.forEach((row, l) => {
     row.forEach((value, e) => {
-      state.cells[l][e].heat.setAttribute("fill-opacity", (0.03 + (0.3 * value) / peak).toFixed(3));
+      state.cells[l][e].heat.style.fillOpacity = (0.03 + (0.3 * value) / peak).toFixed(3);
     });
   });
   const woken = run.layers.reduce((sum, layer) => sum + new Set(layer.experts.flat()).size, 0) / run.layers.length;
@@ -135,8 +136,8 @@ function show(j) {
     state.cells[l].forEach((cell, e) => {
       const weight = now.get(e);
       const lit = !state.whole && weight !== undefined;
-      cell.pick.setAttribute("opacity", lit ? (0.45 + 0.55 * Math.min(1, weight * 3)).toFixed(2) : 0);
-      cell.ring.setAttribute("opacity", lit && before.has(e) ? 1 : 0);
+      cell.pick.style.opacity = lit ? (0.45 + 0.55 * Math.min(1, weight * 3)).toFixed(2) : 0;
+      cell.ring.style.opacity = lit && before.has(e) ? 1 : 0;
       if (lit && before.has(e)) shared++;
     });
   });
@@ -288,9 +289,16 @@ export async function initRoute() {
     if (state.whole) pause();
   });
   pickRun(0);
+  // The grid only steps while it is on screen. Off screen it would still redraw, and that takes time from a run of
+  // Figure 1 on the same GPU.
+  new IntersectionObserver(([entry]) => {
+    state.seen = entry.isIntersecting;
+  }).observe(grid);
   setInterval(
     () => {
-      if (state.playing && !state.whole) show((state.current + 1) % state.trace.runs[state.run].tokens.length);
+      if (state.seen && state.playing && !state.whole) {
+        show((state.current + 1) % state.trace.runs[state.run].tokens.length);
+      }
     },
     calm ? 2400 : 900,
   );

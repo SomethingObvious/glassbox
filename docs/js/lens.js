@@ -24,19 +24,26 @@ function pick(layer, position) {
     `After layer ${layer + 1} of ${run.layers.length}, at `,
     Object.assign(document.createElement("b"), { textContent: shown(run.tokens[position]) }),
   );
-  $("l-top").replaceChildren(
-    ...top.map(([text, p]) => {
-      const li = document.createElement("li");
-      const bar = Object.assign(document.createElement("i"), { className: "l-bar" });
-      bar.style.width = `${100 * p}%`;
-      li.append(
-        Object.assign(document.createElement("span"), { className: "l-tok", textContent: shown(text) }),
-        Object.assign(document.createElement("span"), { textContent: `${(100 * p).toFixed(1)}%` }),
-        bar,
-      );
-      return li;
-    }),
-  );
+  // The five rows are made once and rewritten, so each bar slides from its last length to the new one.
+  if (!$("l-top").children.length) {
+    $("l-top").append(
+      ...top.map(() => {
+        const li = document.createElement("li");
+        li.append(
+          Object.assign(document.createElement("span"), { className: "l-tok" }),
+          document.createElement("span"),
+          Object.assign(document.createElement("i"), { className: "l-bar" }),
+        );
+        return li;
+      }),
+    );
+  }
+  for (const [i, [text, p]] of top.entries()) {
+    const [token, share, bar] = $("l-top").children[i].children;
+    token.textContent = shown(text);
+    share.textContent = `${(100 * p).toFixed(1)}%`;
+    bar.style.transform = `scaleX(${p})`;
+  }
 }
 
 function pickRun(index) {
@@ -64,6 +71,12 @@ function pickRun(index) {
     });
   });
   grid.replaceChildren(...cells);
+  // A new prompt's grid comes in from the first layer down, as the first one did. Before the figure has been
+  // seen that first wipe is still waiting, and playing it here would spend it off screen.
+  for (const wipe of grid.closest(".unruled") ? [] : grid.getAnimations()) {
+    wipe.cancel();
+    wipe.play();
+  }
   // On a narrow screen the grid scrolls, and the answer is in the last column.
   grid.parentElement.scrollLeft = grid.scrollWidth;
   const last = run.tokens.length - 1;

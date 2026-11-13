@@ -1,6 +1,7 @@
-import { $, canvas, json, onScheme, tone } from "./dom.js";
+import { $, calm, canvas, json, onScheme, tone } from "./dom.js";
 
-const state = { trace: null, run: 0 };
+const state = { trace: null, run: 0, row: null, out: null, frame: 0 };
+const SLIDE = 400; // milliseconds a tick takes to reach a new grid
 const FORMATS = {
   int8: { bits: 8 },
   "fp8 e4m3": { bits: 8, fp8: true },
@@ -78,14 +79,54 @@ function settings() {
   return { row, where, format, group };
 }
 
-function draw() {
-  const { row, where, format, group } = settings();
-  const { out, grids } = quantize(row, format, group);
+/** The index of the row's biggest weight. */
+function biggest(row) {
   let peak = 0;
   row.forEach((v, i) => {
     if (Math.abs(v) > Math.abs(row[peak])) peak = i;
   });
-  const start = Math.floor(peak / 128) * 128;
+  return peak;
+}
+
+/**
+ * Rounds the row again and fills in the readout. With `slide`, each tick moves to its new place from where it was
+ * drawn last, or from its own weight when the row is new, which is the rounding the figure is about.
+ */
+function draw(slide = false) {
+  const { row, format, group } = settings();
+  const { out, grids } = quantize(row, format, group);
+  const peak = biggest(row);
+  const home = grids.find((g) => g.start <= peak && peak < g.end);
+  const used = new Set(Array.from(out.subarray(home.start, home.end), (v) => v.toPrecision(6))).size;
+  const scales = format.fp8 ? 16 : 32;
+  const rms = (list) => Math.sqrt(list.reduce((sum, v) => sum + v * v, 0) / list.length);
+  $("q-bits").textContent = (format.bits + scales / group).toFixed(2);
+  $("q-used").textContent = format.fp8 ? used : `${used} of ${2 ** format.bits}`;
+  $("q-err").textContent = `${(100 * (rms(row.map((v, i) => v - out[i])) / rms(row))).toFixed(1)}%`;
+
+  cancelAnimationFrame(state.frame);
+  const from = state.row === row ? state.out : Float64Array.from(row);
+  state.row = row;
+  if (calm || !slide) {
+    state.out = out;
+    paint(out, grids);
+    return;
+  }
+  const started = performance.now();
+  const step = (now) => {
+    const t = Math.min(1, Math.max(0, now - started) / SLIDE);
+    const eased = 1 - (1 - t) ** 3;
+    state.out = out.map((v, i) => from[i] + (v - from[i]) * eased);
+    paint(state.out, grids);
+    if (t < 1) state.frame = requestAnimationFrame(step);
+  };
+  state.frame = requestAnimationFrame(step);
+}
+
+/** Draws the plot with each rounded weight at `out`, which is between two grids while the ticks slide. */
+function paint(out, grids) {
+  const { row, where } = settings();
+  const start = Math.floor(biggest(row) / 128) * 128;
   const shown = row.slice(start, start + 128);
 
   const { ctx, width, height } = canvas($("q-plot"));
@@ -151,14 +192,16 @@ function draw() {
     ctx.arc(X(i), Y(v), 2.6, 0, 2 * Math.PI);
     ctx.fill();
   });
+}
 
-  const home = grids.find((g) => g.start <= peak && peak < g.end);
-  const used = new Set(Array.from(out.subarray(home.start, home.end), (v) => v.toPrecision(6))).size;
-  const scales = format.fp8 ? 16 : 32;
-  const rms = (list) => Math.sqrt(list.reduce((sum, v) => sum + v * v, 0) / list.length);
-  $("q-bits").textContent = (format.bits + scales / group).toFixed(2);
-  $("q-used").textContent = format.fp8 ? used : `${used} of ${2 ** format.bits}`;
-  $("q-err").textContent = `${(100 * (rms(row.map((v, i) => v - out[i])) / rms(row))).toFixed(1)}%`;
+/** What a run wrote, marked where it leaves bf16's text. */
+function written(run) {
+  return run.tokens.map((text, i) =>
+    Object.assign(document.createElement("span"), {
+      textContent: text,
+      className: i < run.same ? "" : i === run.same ? "miss" : "after",
+    }),
+  );
 }
 
 function pickRun(index) {
@@ -167,14 +210,7 @@ function pickRun(index) {
   for (const [i, button] of document.querySelectorAll("#q-runs button").entries()) {
     button.setAttribute("aria-pressed", i === index);
   }
-  $("q-text").replaceChildren(
-    ...run.tokens.map((text, i) =>
-      Object.assign(document.createElement("span"), {
-        textContent: text,
-        className: i < run.same ? "" : i === run.same ? "miss" : "after",
-      }),
-    ),
-  );
+  $("q-text").replaceChildren(...written(run));
   $("q-say").textContent =
     run.bits === 16
       ? "Qwen3-0.6B as it ships. Every other format is compared with this text."
@@ -203,9 +239,28 @@ export async function initQuant() {
     tr.insertCell().textContent = run.kl.toFixed(4);
     tr.insertCell().textContent = run.same;
   }
-  for (const id of ["q-row", "q-format", "q-group"]) $(id).addEventListener("input", draw);
-  new ResizeObserver(draw).observe($("q-plot"));
-  onScheme(draw);
-  document.fonts.ready.then(draw);
+  // Every format's text is laid out unseen under the one shown, so picking another moves nothing below it.
+  $("q-room").replaceChildren(
+    ...runs.map((run) => {
+      const copy = Object.assign(document.createElement("div"), { className: "out q-out" });
+      copy.append(...written(run));
+      return copy;
+    }),
+  );
+  for (const id of ["q-row", "q-format", "q-group"]) $(id).addEventListener("input", () => draw(true));
+  new ResizeObserver(() => draw()).observe($("q-plot"));
+  onScheme(() => draw());
+  document.fonts.ready.then(() => draw());
+  // The first time the plot is seen, its ticks leave their weights for the grid.
+  const seen = new IntersectionObserver(
+    ([plot]) => {
+      if (!plot.isIntersecting) return;
+      seen.disconnect();
+      state.row = null;
+      draw(true);
+    },
+    { threshold: 0.5 },
+  );
+  seen.observe($("q-plot"));
   pickRun(Math.min(3, runs.length - 1));
 }

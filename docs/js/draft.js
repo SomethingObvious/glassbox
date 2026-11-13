@@ -1,4 +1,5 @@
 import { $, calm, json, sleep } from "./dom.js";
+import { scan } from "./scan.js";
 import { LIBRARY, partial, pieces } from "./tokens.js";
 import { cached, runtime } from "./weights.js";
 
@@ -9,14 +10,17 @@ const TARGET_REVISION = "f9b9656836a4315a690d0270f885b0758923bd13";
 const WEIGHTS = `https://huggingface.co/${TARGET}/resolve/${TARGET_REVISION}/onnx/model_q4f16.onnx_data`;
 // That graph alone and with the head after it, both made for graph capture by `python -m switchboard head`.
 const HEAD =
-  "https://huggingface.co/hoyporti/qwen3-1.7b-eagle3-switchboard/resolve/6bf573089df552c760941f83fcf212ca4bfdd692/onnx";
+  "https://huggingface.co/hoyporti/qwen3-1.7b-eagle3-switchboard/resolve/9b7a764d7efa6beba50f550f9029e897b2a399ee/onnx";
 const STOP = new Set([151643, 151645]); // Qwen3 <|endoftext|> and <|im_end|>
 // A third guess would make a pass 4 rows, which onnxruntime's 4-bit matmul takes twice as long over as 3.
 const GUESSES = 2;
+const [VOCABULARY, WIDTH] = [151936, 2048]; // the embedding table's rows and columns
+const CHOICES = 1024; // the tokens the graphs score in fp16, after a 4-bit pass over the whole vocabulary
 const ENTRIES = 1024; // cache rows on the GPU, the most a prompt and its answer can fill
 // Passes on the GPU at once. A pick takes about 2 ms to reach the CPU, and with one pass at a time the GPU waits it out.
 const DEPTH = 2;
 const TRIAL = 24; // passes the head gets before it can be switched off for writing slower than alone
+const MOST = 96; // new tokens a live run writes
 
 const state = {
   ort: null,
@@ -26,6 +30,7 @@ const state = {
   busy: false,
   replaying: false,
   raceId: 0,
+  plays: 0,
 };
 
 const TODAY = "https://raw.githubusercontent.com/SomethingObvious/switchboard/live/draft.json";
@@ -95,10 +100,6 @@ async function race({ steps, timing }, speed) {
     timing.alone.map(() => 1),
   );
   const total = spec.at(-1)[1];
-  const words = steps.flatMap((s) => [...s.drafted.slice(0, s.kept), s.target]);
-  // The trace only keeps the guessed run's tokens, which are the alone run's too when the texts match.
-  aloneText(timing.same ? words : []);
-  $("race-alone-box").hidden = !timing.same;
   const end = Math.max(spec.at(-1)[0], alone.at(-1)[0]);
   const started = performance.now();
   for (;;) {
@@ -117,28 +118,22 @@ async function race({ steps, timing }, speed) {
     if (now >= end) break;
     await sleep(40);
   }
-  const pace = speed === 1 ? "real speed" : `${speed.toFixed(1)} times real speed`;
-  $("race-note").textContent =
-    `${timing.same ? "The same text" : "Nearly the same text"} written both ways. ` +
-    `Every pass was timed on ${timing.device}, and the race plays at ${pace}.`;
+  $("race-note").classList.add("on");
 }
 
 function resetStats(depth) {
   state.raceId++;
-  aloneText([]);
   lane("spec", 0, 0, 0);
   lane("alone", 0, 0, 0);
-  $("race-note").textContent = "";
+  $("race-note").classList.remove("on");
   for (const id of ["s-tok", "s-pass", "s-rate"]) $(id).textContent = "0";
   $("s-per").textContent = $("s-fast").textContent = "0.00";
   const bars = Array.from({ length: depth }, (_, i) => {
     const bar = document.createElement("div");
     bar.dataset.l = i + 1;
-    bar.style.height = "2px";
     return bar;
   });
   $("s-hist").replaceChildren(...bars);
-  $("d-out").replaceChildren();
 }
 
 function showStats(steps, seconds, alone) {
@@ -151,22 +146,98 @@ function showStats(steps, seconds, alone) {
   [...$("s-hist").children].forEach((bar, j) => {
     const reached = steps.filter((s) => s.drafted.length > j).length;
     const kept = steps.filter((s) => s.kept > j).length;
-    bar.style.height = `${reached ? (36 * kept) / reached : 2}px`;
+    bar.style.setProperty("--kept", reached ? kept / reached : 0);
   });
 }
 
-function token(text, className) {
+/**
+ * Gives the output box room for the guesses that could run a line past the finished answer, so nothing under it
+ * moves while it plays. Each pass near the end gets an unseen copy of the text as it stands with all its guesses.
+ */
+function reserve(steps) {
+  const span = (text, className = "") => piece(text, className);
+  const layer = (nodes) => {
+    const copy = Object.assign(document.createElement("div"), { className: "out" });
+    copy.append(...nodes);
+    return copy;
+  };
+  const answer = steps.flatMap((s) => [...s.drafted.slice(0, s.kept).map((text) => span(text)), span(s.target, "own")]);
+  const layers = [];
+  let written = 0;
+  let left = answer.reduce((sum, node) => sum + node.textContent.length, 0);
+  for (const s of steps) {
+    const guessed = s.drafted.reduce((sum, text) => sum + partial(text)[0].length, 0);
+    // A guess can wrap a line sooner than the answer does, so a pass counts as near the end a line or so early.
+    if (guessed + 120 > left) {
+      const before = answer.slice(0, written).map((node) => node.cloneNode(true));
+      layers.push(layer([...before, ...s.drafted.map((text) => span(text))]));
+    }
+    for (const node of answer.slice(written, written + s.kept + 1)) left -= node.textContent.length;
+    written += s.kept + 1;
+  }
+  $("d-room").replaceChildren(...layers);
+}
+
+/**
+ * Lays out everything a run will fill before any of it shows, so the figure is its final size from the first token.
+ * Returns how many times real speed the run plays at.
+ */
+function stage({ steps, timing }) {
+  reserve(steps);
+  // The whole answer is laid out now and each token only shown once it is written, so the box is its final size
+  // and no word is seen to move when the rest of it arrives.
+  state.text = steps.flatMap((s) => [
+    ...s.drafted.slice(0, s.kept).map((text) => piece(text, "wait")),
+    piece(s.target, "wait own"),
+  ]);
+  $("d-out").replaceChildren(...state.text);
+  $("d-miss").replaceChildren();
+  // The trace only keeps the guessed run's tokens, which are the alone run's too when the texts match.
+  aloneText(timing.same ? steps.flatMap((s) => [...s.drafted.slice(0, s.kept), s.target]) : []);
+  $("race-alone-box").hidden = !timing.same;
+  const longest = Math.max(
+    secondsIn(steps),
+    timing.alone.reduce((a, b) => a + b, 0),
+  );
+  const speed = Math.max(1, longest / RACE);
+  const pace = speed === 1 ? "real speed" : `${speed.toFixed(1)} times real speed`;
+  $("race-note").textContent =
+    `${timing.same ? "The same text" : "Nearly the same text"} written both ways. ` +
+    `Every pass was timed on ${timing.device}, and the race plays at ${pace}.`;
+  return speed;
+}
+
+/** A token's span, with its word apart from the space before it so that only the word can be underlined. */
+function piece(text, className) {
   // A token holding part of a character shows nothing of it, since the token that finishes it shows it whole.
-  const node = Object.assign(document.createElement("span"), { textContent: partial(text)[0], className });
-  $("d-out").append(node);
+  const shown = partial(text)[0];
+  const word = shown.trimStart();
+  const node = Object.assign(document.createElement("span"), { className });
+  node.append(
+    shown.slice(0, shown.length - word.length),
+    Object.assign(document.createElement("b"), { className: "w", textContent: word }),
+  );
   return node;
 }
 
-/** Animates one pass: guesses appear, the check colours them, then the misses go and the big model's token lands. */
-async function playStep({ drafted, kept, target }, pace) {
-  const guesses = [];
-  for (const text of drafted) {
-    guesses.push(token(text, "guess"));
+/**
+ * Animates one pass: guesses appear, the check colours them, then the misses go and the big model's token lands.
+ * `text` is the answer's tokens as laid out, and `first` is where the pass starts in them.
+ */
+async function playStep({ drafted, kept }, text, first, pace) {
+  // The guesses that will be kept are the answer's own tokens, shown where they already are. The rest go in a
+  // layer over the text, after unseen copies of all that comes before them, which puts them where they would
+  // have been written and lets them go without anything else moving.
+  const turned = drafted.slice(kept).map((text) => piece(text, "wait"));
+  const before = text.slice(0, first + kept).map((node) => {
+    const copy = node.cloneNode(true);
+    copy.className = node.classList.contains("own") ? "wait own" : "wait";
+    return copy;
+  });
+  $("d-miss").replaceChildren(...before, ...turned);
+  const guesses = [...text.slice(first, first + kept), ...turned];
+  for (const node of guesses) {
+    node.className = "guess";
     if (pace) await sleep(pace * 0.15);
   }
   if (pace) await sleep(pace * 0.6);
@@ -174,9 +245,10 @@ async function playStep({ drafted, kept, target }, pace) {
     node.className = j < kept ? "kept" : j === kept ? "miss" : "guess gone";
   });
   if (pace) await sleep(pace);
-  for (const node of guesses.slice(kept)) node.remove();
+  // A playback started since this pass began has laid the layer out again for itself.
+  if (state.text === text) $("d-miss").replaceChildren();
   for (const node of guesses.slice(0, kept)) node.className = "";
-  token(target, "own");
+  text[first + kept].className = "own";
 }
 
 async function loadModels() {
@@ -195,10 +267,31 @@ async function loadModels() {
   const [graph, weights, pass, headWeights] = await Promise.all(
     [`${HEAD}/big.onnx`, WEIGHTS, `${HEAD}/pass.onnx`, `${HEAD}/head.onnx.data`].map(file),
   );
+  // The graphs score the vocabulary with a 4-bit copy of the embedding table, which is the first thing in the
+  // weights. Making it here takes a few seconds and saves a 175 MB download.
+  const table = new Uint16Array(weights.buffer, weights.byteOffset, VOCABULARY * WIDTH);
+  const rough = await scan(table, WIDTH, (done) => {
+    status("Making the 4-bit copy of the vocabulary...", done);
+    return sleep(0);
+  });
   status("Loading the model onto the GPU...", 1);
-  const hosted = { path: "model_q4f16.onnx_data", data: weights };
-  state.big = await captured(graph, [hosted], 1);
-  state.pass = await captured(pass, [hosted, { path: "head.onnx.data", data: headWeights }], GUESSES + 1, state.big);
+  const files = [
+    { path: "model_q4f16.onnx_data", data: weights },
+    { path: "head.onnx.data", data: headWeights },
+    { path: "scan.data", data: rough },
+  ];
+  state.big = await captured(graph, files, 1);
+  state.pass = await captured(pass, files, GUESSES + 1, state.big);
+  // Whatever else this cache holds from the head's repo is under an address the page does not ask for.
+  const repo = HEAD.slice(0, HEAD.indexOf("/resolve/"));
+  caches
+    .open("switchboard-routes")
+    .then(async (cache) => {
+      for (const { url } of await cache.keys()) {
+        if (url.startsWith(repo) && !url.startsWith(HEAD)) await cache.delete(url);
+      }
+    })
+    .catch(() => {});
 }
 
 /**
@@ -231,7 +324,8 @@ async function captured(bytes, externalData, rows, kin) {
     total: ["int32", [], 4],
     wants: ["int64", [1, rows], 8],
     guesses: ["int64", [1, rows], 8],
-    logits_fp16: ["float16", [1, rows, 151936], 2],
+    logits_fp16: ["float16", [1, rows, CHOICES, 1], 2],
+    choices: ["float32", [1, rows, CHOICES / 128, 128], 4],
     then_input_ids: ["int64", [1, rows], 8],
     then_position_ids: ["int64", [1, rows], 8],
     then_seqlens: ["int32", [1, 1], 4],
@@ -495,11 +589,12 @@ async function alone(prompt, n, each = () => {}) {
 /** The big model's two best tokens after `ids`, as text with their logits. It wrote the last `said` of them. */
 async function topTwo(ids, said) {
   await read(state.big, ids);
-  const [bytes] = await readBack(state.big, [state.big.fetches.logits_fp16]);
-  const row = Array.from(new Uint16Array(bytes, 0, 151936), half);
+  const [bytes, tokens] = await readBack(state.big, [state.big.fetches.logits_fp16, state.big.fetches.choices]);
+  const row = Array.from(new Uint16Array(bytes, 0, CHOICES), half);
+  const choices = new Float32Array(tokens, 0, CHOICES);
   const order = [...row.keys()].sort((a, b) => row[b] - row[a]).slice(0, 2);
   const written = said ? ids.slice(-said) : [];
-  return order.map((id) => ({ text: pieces(state.tok, [...written, id]).at(-1), logit: row[id] }));
+  return order.map((at) => ({ text: pieces(state.tok, [...written, choices[at]]).at(-1), logit: row[at] }));
 }
 
 /** An fp16 number from its 16 bits. */
@@ -521,7 +616,6 @@ async function run() {
   state.replaying = false;
   setBusy(true);
   const depth = GUESSES;
-  const most = Number($("d-max").value);
   const text = $("d-prompt").value;
   let trace;
   let said;
@@ -536,18 +630,20 @@ async function run() {
     // A pass writes a row for each guess, and the passes still on the GPU when the answer ends write past it too.
     const room = ENTRIES - prompt.length - (GUESSES + 1) * (DEPTH + 2);
     if (room < 16) throw new Error(`the prompt is ${prompt.length} tokens, and this run has room for ${ENTRIES}`);
-    resetStats(depth);
+    // What is on the figure stays there, dimmed, until the new run is ready to play in a box of its own size.
+    state.raceId++;
+    $("figure-1").classList.add("stale");
     // The first passes of each shape compile shaders, so both ways get a few before the clock counts.
     status("Warming up...", 1);
     await guessed(prompt, 8);
     await alone(prompt, 3);
     // Alone goes first, so the guessed run knows the pace it has to beat. A last pass that keeps its guesses writes
     // that many tokens more than asked for, which alone writes too.
-    const solo = await alone(prompt, Math.min(most, room) + GUESSES, (done) =>
+    const solo = await alone(prompt, Math.min(MOST, room) + GUESSES, (done) =>
       status(`Writing alone on this GPU, ${done.length} tokens so far...`),
     );
     const pace = solo.times.reduce((a, b) => a + b) / (solo.times.length - 1);
-    const passes = await guessed(prompt, Math.min(most, room), pace, (done) =>
+    const passes = await guessed(prompt, Math.min(MOST, room), pace, (done) =>
       status(`Writing the same answer with guesses, ${tokensIn(done)} tokens so far...`),
     );
     const ours = passes.flatMap((pass) => [...pass.guesses.slice(0, pass.kept), pass.own]);
@@ -591,9 +687,15 @@ async function run() {
   await play(trace, said);
 }
 
+/** Today's recorded run, or the saved one when the live branch can't be reached. */
+const recorded = () => {
+  state.recorded ??= json(TODAY).catch(() => json("data/draft.json"));
+  return state.recorded;
+};
+
 async function replay(keepStatus = false) {
   try {
-    const trace = await json(TODAY).catch(() => json("data/draft.json"));
+    const trace = await recorded();
     const who = `${trace.target.split("/").pop()}, its ${trace.draft} guessing ${trace.depth} tokens a pass`;
     const { title, link, day } = trace.headline ?? {};
     const said = title
@@ -612,24 +714,28 @@ async function replay(keepStatus = false) {
 /** Plays each pass in its own measured slot while the alone lane writes on the same clock. */
 async function play(trace, said) {
   setReplaying(true);
+  state.started = true;
+  const id = ++state.plays;
+  // A live run takes over the figure, and so does a playback started after this one (which is what the button
+  // does in a browser with no WebGPU).
+  const over = () => !state.replaying || state.plays !== id;
   try {
     resetStats(trace.depth);
+    const speed = stage(trace);
+    const text = state.text;
+    $("figure-1").classList.remove("stale");
     if (said) status(said, 1);
-    const longest = Math.max(
-      secondsIn(trace.steps),
-      trace.timing.alone.reduce((a, b) => a + b, 0),
-    );
-    const speed = Math.max(1, longest / RACE);
     const raced = race(trace, speed);
     const started = performance.now();
     let at = 0;
     for (const [i, step] of trace.steps.entries()) {
-      // A live run takes over the figure.
-      if (!state.replaying) return;
+      if (over()) return;
       const wait = (1000 * at) / speed - (performance.now() - started);
       if (!calm && wait > 0) await sleep(wait);
       // playStep spends about 2.2 paces on a pass with 4 guesses.
-      await playStep(step, calm ? 0 : (1000 * step.seconds) / speed / 2.2);
+      const pace = calm ? 0 : (1000 * step.seconds) / speed / 2.2;
+      await playStep(step, text, tokensIn(trace.steps.slice(0, i)), pace);
+      if (over()) return;
       at += step.seconds;
       const done = trace.steps.slice(0, i + 1);
       // What the big model alone took to get as far as the guessed run has by now.
@@ -638,7 +744,7 @@ async function play(trace, said) {
     }
     await raced;
   } finally {
-    setReplaying(false);
+    if (state.plays === id) setReplaying(false);
   }
 }
 
@@ -651,9 +757,17 @@ export function initDraft() {
       run();
     });
   }
+  // The box takes the recorded run's size as soon as the run is known, before it scrolls into view and plays.
+  // Until then the stylesheet keeps what sits under the box unseen.
+  recorded()
+    .then((trace) => state.started || stage(trace))
+    .catch(() => {})
+    // The page's own type can wrap the text onto one more line, so the size isn't known until it has arrived.
+    .then(() => Promise.race([document.fonts.ready, sleep(1500)]))
+    .finally(() => $("figure-1").classList.remove("unsized"));
   const watcher = new IntersectionObserver(
     (entries) => {
-      if (entries.some((e) => e.isIntersecting) && !state.busy && !state.replaying && !$("d-out").textContent) {
+      if (entries.some((e) => e.isIntersecting) && !state.busy && !state.replaying && !state.started) {
         watcher.disconnect();
         replay();
       }

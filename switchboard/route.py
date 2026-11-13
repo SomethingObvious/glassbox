@@ -7,7 +7,7 @@ from itertools import pairwise
 from typing import NotRequired, TypedDict
 
 from . import pieces
-from .svg import FAINT, INK, MONO, SERIF, SHEET, SOFT, Timeline, W, callout, document, rect, text
+from .svg import FAINT, INK, MONO, SERIF, SHEET, SOFT, Timeline, W, callout, document, paint, rect, text
 
 MODEL = "ibm-granite/granite-3.0-1b-a400m-instruct"
 SENTENCES = (
@@ -19,6 +19,7 @@ SENTENCES = (
     "Launch day! 🚀 Our app hit 10,000 users in 24 hours 🎉",
 )
 SLOT, FADE = 0.85, 0.2  # seconds each token stays lit, and seconds it takes to hand over to the next
+SWEEP = 0.012  # seconds each layer's picks come up after the layer above's
 
 
 class Layer(TypedDict):
@@ -132,16 +133,22 @@ def render(t: Trace, subtitle: str = "") -> str:
                 rect(gx + e * cw, y, cw - 3, ch - 3, INK, extra=heat),
             ]
         for ti, (row, weights) in enumerate(zip(layer["experts"], layer["weights"], strict=True)):
+            before = set(layer["experts"][ti - 1]) if ti else set()
+            # The layer's class delays its picks, so a token's experts come up in the order the pass picks them.
+            cls = f"{lit[ti]} l{li}"
             for e, wt in zip(row, weights, strict=True):
                 strength = f' fill-opacity="{0.45 + 0.55 * min(1, wt * 3):.2f}"'
-                body.append(rect(gx + e * cw, y, cw - 3, ch - 3, INK, cls=lit[ti], extra=strength))
+                body.append(rect(gx + e * cw, y, cw - 3, ch - 3, INK, cls=cls, extra=strength))
+                if e in before:
+                    body.append(dot(gx + e * cw + (cw - 3) / 2, y + (ch - 3) / 2, cls))
 
     sx = gx + n * cw + 50
     for j, (swatch, numeral, label, more) in enumerate(
         [
-            (rect(sx, gy + 6, 18, 18, INK), 202, "an expert this token", "goes to, darker for more weight"),
+            (rect(sx, gy + 6, 18, 18, INK), 202, "an expert this token", "goes to, stronger for more weight"),
+            (rect(sx, gy + 72, 18, 18, INK) + dot(sx + 9, gy + 81), 204, "also used by", "the token before"),
             (
-                rect(sx, gy + 6 + 66, 18, 18, INK, extra=' fill-opacity="0.15"'),
+                rect(sx, gy + 6 + 132, 18, 18, INK, extra=' fill-opacity="0.15"'),
                 206,
                 "the sentence's total",
                 "weight on that expert",
@@ -162,10 +169,18 @@ def render(t: Trace, subtitle: str = "") -> str:
         f"{len(tokens)}-token sentence wakes up",
         f"{woken:.1f} of the {n} in a layer on average.",
     ]
-    body += [text(sx, gy + 190 + 27 * j, line, 17, SOFT) for j, line in enumerate(lines)]
+    body += [text(sx, gy + 250 + 27 * j, line, 17, SOFT) for j, line in enumerate(lines)]
+    # These come after the timeline's rules, whose `animation` shorthand would set the delay back to none.
+    delays = "".join(f".l{li}{{animation-delay:{li * SWEEP:g}s}}" for li in range(1, len(layers)))
     return document(
         "A mixture-of-experts router picking experts for each token, layer by layer",
         int(gy + len(layers) * ch + 40),
-        tl.css(",".join(f".{c}" for c in lit) + "{opacity:0}"),
+        tl.css(",".join(f".{c}" for c in lit) + "{opacity:0}") + "\n" + delays,
         body,
     )
+
+
+def dot(x: float, y: float, cls: str = "") -> str:
+    """The mark on an expert that the token before went to as well."""
+    c = f' class="{cls}"' if cls else ""
+    return f'<circle{c} cx="{x:.1f}" cy="{y:.1f}" r="3"{paint(SHEET)}/>'
