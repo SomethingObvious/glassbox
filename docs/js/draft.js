@@ -705,7 +705,7 @@ async function replay(keepStatus = false) {
           Object.assign(document.createElement("a"), { href: link, textContent: title }),
           // A day the story couldn't be read, the model only asks about its headline.
           how === "read"
-            ? `, summed up from the story's opening by ${who}.`
+            ? `, written up from the story's opening by ${who}.`
             : `, and three questions about it from ${who}.`,
         ]
       : `A recorded run by ${who}.`;

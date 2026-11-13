@@ -58,8 +58,8 @@ class Trace(TypedDict):
 def read(title: str, opening: str) -> str:
     # Asked to explain a headline alone, a model this small makes the story up, so it is given the story's opening.
     return (
-        f'This is how the story behind the Hacker News headline "{title}" opens:\n\n{opening}\n\n'
-        "In three sentences, say what the story is about. Use only what is written above."
+        f'Rewrite the text below as the first three sentences of a news article headlined "{title}". Begin '
+        f"with who or what the news is about, and use only facts from the text.\n\n{opening}"
     )
 
 

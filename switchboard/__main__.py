@@ -25,7 +25,7 @@ def save(path: Path, svg: str) -> None:
 
 
 def told_today(title: str, link: str, day: str, place: int) -> draft.Trace:
-    """The day's run of Figure 1: the story summed up from its opening, or else three questions about its headline.
+    """The day's run of Figure 1: the story's opening written up as news, or else three questions about its headline.
 
     A run whose answer names anything the model wasn't shown has made it up, and the saved prompt runs if both do.
     """
