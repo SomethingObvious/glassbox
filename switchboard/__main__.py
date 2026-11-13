@@ -24,6 +24,28 @@ def save(path: Path, svg: str) -> None:
     print(f"{path} ({path.stat().st_size / 1024:.0f} KB)")
 
 
+def told_today(title: str, link: str, day: str) -> draft.Trace:
+    """The day's run of Figure 1: the story summed up from its opening, or else three questions about its headline.
+
+    A run whose answer names anything the model wasn't shown has made it up, and the saved prompt runs if both do.
+    """
+    opening = route.story(link)
+    tries = [(draft.read(title, opening), f"{title} {opening}", "read")] if opening else []
+    tries.append((draft.ask(title), title, "asked"))
+    for prompt, shown, how in tries:
+        t = draft.trace(prompt)
+        new = draft.invented(shown, "".join(p for s in t["steps"] for p in [*s["drafted"][: s["kept"]], s["target"]]))
+        if not new:
+            # The page shows the day, links the story and says whether the model read it.
+            t["headline"] = {"title": title, "link": link, "day": day, "how": how}
+            if how == "read":
+                # The story's own words stay out of what is published.
+                t["prompt"] = draft.read(title, "[its first paragraphs]")
+            return t
+        print(f"Dropped the run that {how}, as its answer names {', '.join(new)}")
+    return draft.trace()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="switchboard", description=__doc__)
     parser.add_argument("banner", choices=["route", "draft", "quant", "lens", "routes", "head"])
@@ -48,15 +70,7 @@ def main() -> None:
             title, link, day = told["runs"][0]["text"], told["headline"]["link"], told["headline"]["day"]
         else:
             title, link = route.headline()
-        t = draft.trace(draft.ask(title))
-        new = draft.invented(title, "".join(p for s in t["steps"] for p in [*s["drafted"][: s["kept"]], s["target"]]))
-        if new:
-            # The model hasn't read the story, so the day's run is the saved prompt instead.
-            print(f"Left the headline out, as the answer names {', '.join(new)}")
-            t = draft.trace()
-        else:
-            # The page shows the day and links the story beside the run.
-            t["headline"] = {"title": title, "link": link, "day": day}
+        t = told_today(title, link, day)
         save(args.headline, draft.render(t))
         args.headline.with_suffix(".json").write_text(json.dumps(t), encoding="utf-8")
     elif args.headline:

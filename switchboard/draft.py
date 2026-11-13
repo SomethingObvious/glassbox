@@ -20,10 +20,15 @@ CHAR, LINE_H, MARGIN = 12.0, 46, 60  # px per 20 px mono character, px per line
 SMALL, SMALL_H = 9.0, 26  # the same for the 15 px text of the run alone
 LEAD, HOLD, OUT = 1.0, 4.0, 0.5  # seconds before the banner starts writing, after it finishes, and to fade out
 RACE = 20.0  # most seconds the banner takes to write before it plays faster than real time
-WORD = re.compile(r"[A-Za-z][A-Za-z'-]*|\d[\d,.]*")
+WORD = re.compile(r"[^\W\d_](?:[^\W\d_]|')*|\d[\d,.]*")
+# Words that start a sentence with a capital letter and name nothing.
 OPENERS = frozenset(
-    {"what", "why", "how", "who", "whom", "whose", "when", "where", "which", "is", "are", "was", "were"}
-    | {"does", "do", "did", "will", "can", "could", "would", "should", "has", "have"}
+    WORD.findall(
+        "what why how who whom whose when where which is are was were does do did will can could would should has "
+        "have the a an it its this that these those they their he his she her we our you there here in on at by for "
+        "with from to as of after before during since while although though because if but and or so however also "
+        "some many most one two three both each all no not"
+    )
 )
 
 
@@ -50,8 +55,16 @@ class Trace(TypedDict):
     headline: NotRequired[dict[str, str]]
 
 
+def read(title: str, opening: str) -> str:
+    # Asked to explain a headline alone, a model this small makes the story up, so it is given the story's opening.
+    return (
+        f'This is how the story behind the Hacker News headline "{title}" opens:\n\n{opening}\n\n'
+        "In three sentences, say what the story is about. Use only what is written above."
+    )
+
+
 def ask(title: str) -> str:
-    # Asked to explain a headline, a model this small makes the story up, so it asks about it instead.
+    """What the model is asked on a day the story can't be read."""
     return (
         f'You have not read the story behind this Hacker News headline: "{title}"\n'
         "Write three short questions you would want it to answer, one per line. Name nothing the headline does "
@@ -59,19 +72,19 @@ def ask(title: str) -> str:
     )
 
 
-def invented(title: str, answer: str) -> list[str]:
-    """The names and numbers in `answer` that `title` doesn't have, which the model can only have made up.
+def invented(shown: str, answer: str) -> list[str]:
+    """The names and numbers in `answer` that `shown` doesn't have, which the model can only have made up.
 
-    A name is a capitalised word, unless it is a question word that opens a line.
+    A name is a capitalised word, unless it opens a sentence and is one of the common words that do.
     """
     # ponytail: capital letters and digits are all it looks at, so something made up in lower case gets past it.
 
     def bare(word: str) -> str:
-        return word.lower().removesuffix("'s").rstrip("'")
+        return word.lower().removesuffix("'s").rstrip("'.,")
 
-    known = {bare(w) for w in WORD.findall(title)}
+    known = {bare(w) for w in WORD.findall(shown.replace("’", "'"))}
     found = []
-    for sentence in re.split(r"(?<=[.?!])\s+|\n+", answer):
+    for sentence in re.split(r"(?<=[.?!])\s+|\n+", answer.replace("’", "'")):
         words = WORD.findall(re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", sentence))
         for at, word in enumerate(words):
             named = word[0].isdigit() or (word[0].isupper() and (at > 0 or word.lower() not in OPENERS))

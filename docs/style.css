@@ -779,6 +779,7 @@ canvas {
 .lane-text {
   margin: 0;
   font: 16px / 1.6 var(--sans);
+  white-space: pre-wrap;
   color: var(--ink);
 }
 /* Every word is laid out from the start and only shown when its token is done, so the text never reflows. */

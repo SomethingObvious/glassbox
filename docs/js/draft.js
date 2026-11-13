@@ -697,12 +697,15 @@ async function replay(keepStatus = false) {
   try {
     const trace = await recorded();
     const who = `${trace.target.split("/").pop()}, its ${trace.draft} guessing ${trace.depth} tokens a pass`;
-    const { title, link, day } = trace.headline ?? {};
+    const { title, link, day, how } = trace.headline ?? {};
     const said = title
       ? [
           `Today's top Hacker News headline${day ? ` (${day})` : ""}, `,
           Object.assign(document.createElement("a"), { href: link, textContent: title }),
-          `, and three questions about it from ${who}.`,
+          // A day the story couldn't be read, the model only asks about its headline.
+          how === "read"
+            ? `, summed up from the story's opening by ${who}.`
+            : `, and three questions about it from ${who}.`,
         ]
       : `A recorded run by ${who}.`;
     await play(trace, keepStatus ? null : said);

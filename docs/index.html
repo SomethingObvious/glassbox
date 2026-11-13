@@ -63,7 +63,7 @@
     <h1>Inside LLM Inference, Drawn From Real Runs of Small Public Models</h1>
     <p class="author">Paul Wu, <a href="https://github.com/SomethingObvious">github.com/SomethingObvious</a></p>
     <h2 class="abstract-head">Abstract</h2>
-    <p class="abstract">A one-layer EAGLE-3 head reads Qwen3-1.7B's own hidden states and guesses the next four tokens, and Qwen3-1.7B checks all four in one forward pass. Guesses up to the first miss are kept, and the big model adds one token of its own. With greedy decoding the text is exactly what the big model writes alone, just sooner. Every day Figure 1 explains the top Hacker News headline that way on GitHub's CPUs and races it against the big model writing alone, and the button below runs one on your GPU with two guesses a pass.</p>
+    <p class="abstract">A one-layer EAGLE-3 head reads Qwen3-1.7B's own hidden states and guesses the next four tokens, and Qwen3-1.7B checks all four in one forward pass. Guesses up to the first miss are kept, and the big model adds one token of its own. With greedy decoding the text is exactly what the big model writes alone, just sooner. Every day Figure 1 sums up the top Hacker News story that way on GitHub's CPUs and races it against the big model writing alone, and the button below runs one on your GPU with two guesses a pass.</p>
     <div class="action">
       <button id="d-run" class="go">Run Figure 1 on This GPU</button>
       <span class="cost">Downloads 1.5 GB once, then your browser caches it</span>

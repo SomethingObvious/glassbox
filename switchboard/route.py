@@ -1,8 +1,10 @@
 """Which experts IBM Granite 3.0 1B-A400M's router picks for each token, layer by layer."""
 
+import http.client
 import json
 import urllib.request
 from collections.abc import Sequence
+from html.parser import HTMLParser
 from itertools import pairwise
 from typing import NotRequired, TypedDict
 
@@ -10,6 +12,7 @@ from . import pieces
 from .svg import FAINT, INK, MONO, SERIF, SHEET, SOFT, Timeline, W, callout, document, paint, rect, text
 
 MODEL = "ibm-granite/granite-3.0-1b-a400m-instruct"
+BROWSER = {"User-Agent": "Mozilla/5.0"}  # many sites turn away a client that doesn't name a browser
 SENTENCES = (
     "The kernel adds 128 floats per thread, then def main(): print('done') runs in Python.",
     "Bonjour ! Je voudrais un café et deux croissants, s'il vous plaît.",
@@ -78,6 +81,72 @@ def headline() -> tuple[str, str]:
     top = get("https://hacker-news.firebaseio.com/v0/topstories.json")[0]
     title = get(f"https://hacker-news.firebaseio.com/v0/item/{top}.json")["title"]
     return title, f"https://news.ycombinator.com/item?id={top}"
+
+
+class Paragraphs(HTMLParser):
+    """Collects a page's description and the text of its paragraphs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.found: list[str] = []
+        self.inside = self.unseen = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        named = dict(attrs)
+        if tag == "meta" and (named.get("name") or named.get("property")) in {"description", "og:description"}:
+            self.found.append(named.get("content") or "")
+        elif tag == "p":
+            self.found.append("")
+            self.inside += 1
+        elif tag in {"script", "style"}:
+            self.unseen += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "p":
+            self.inside = max(0, self.inside - 1)
+        elif tag in {"script", "style"}:
+            self.unseen = max(0, self.unseen - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self.inside and not self.unseen:
+            self.found[-1] += data
+
+
+def opening(page: str, most: int = 700) -> str:
+    """The first paragraphs of an HTML page, to about `most` characters, or "" when there is too little to go on."""
+    parser = Paragraphs()
+    parser.feed(page)
+    kept: list[str] = []
+    for found in parser.found:
+        said = " ".join(found.split())
+        # Bylines, dates and menus are short, and a description often repeats the first paragraph.
+        if len(said) >= 60 and not any(said[:40] in k or k[:40] in said for k in kept):
+            kept.append(said)
+        if sum(map(len, kept)) >= most:
+            break
+    said = " ".join(kept)[: most + 200]
+    # Cut at the end of a sentence where there is one.
+    end = max(said.rfind(". "), said.rfind("? "), said.rfind("! "))
+    said = said if len(said) < most or end < most // 2 else said[: end + 1]
+    return said if len(said) >= 200 else ""
+
+
+def story(link: str) -> str:
+    """How the story behind a Hacker News discussion page opens, or "" when it can't be read."""
+    item = link.rsplit("=", 1)[-1]
+    try:
+        with urllib.request.urlopen(f"https://hacker-news.firebaseio.com/v0/item/{item}.json", timeout=30) as r:
+            told = json.load(r)
+        if "url" not in told:
+            return opening(f"<p>{told.get('text', '')}</p>")
+        with urllib.request.urlopen(urllib.request.Request(told["url"], headers=BROWSER), timeout=30) as r:
+            if "html" not in r.headers.get_content_type():
+                print(f"Couldn't read the story, as {told['url']} is {r.headers.get_content_type()}")
+                return ""
+            return opening(r.read(2_000_000).decode(r.headers.get_content_charset() or "utf-8", errors="replace"))
+    except (OSError, http.client.HTTPException, ValueError) as error:
+        print(f"Couldn't read the story ({error})")
+        return ""
 
 
 def render(t: Trace, subtitle: str = "") -> str:

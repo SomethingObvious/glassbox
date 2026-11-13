@@ -37,10 +37,29 @@ def test_accepted_stops_at_the_first_miss(guesses, wants, kept):
             "1. How did the alarm go off in 2024?\n2. Is Jane Street moving out of NYC?\n3. Google asked why.",
             ["2024", "Google"],
         ),
+        (
+            "Nvidia’s chief steps down. Jensen Huang led it for 33 years, since 1993.",
+            "The story is about Jensen Huang leaving Nvidia's top job. He led it from 1993. It ran for 33 years.",
+            [],
+        ),
     ],
 )
 def test_invented_finds_only_made_up_names(title, answer, new):
     assert draft.invented(title, answer) == new
+
+
+def test_opening_is_a_pages_first_real_paragraphs():
+    first = "The chief executive told staff on Thursday that he would leave at the end of the year. " * 2
+    page = (
+        '<html><head><meta property="og:description" content="A short note that says what the page is about, '
+        'in a sentence."><style>p { color: red; }</style></head><body><p>By A. Writer</p><script>var p = 1;</script>'
+        f"<p>{first}</p><p>Menu</p><p>A second <b>paragraph</b> with enough words in it to be worth keeping.</p></body>"
+    )
+    assert route.opening(page) == (
+        "A short note that says what the page is about, in a sentence. "
+        f"{first.strip()} A second paragraph with enough words in it to be worth keeping."
+    )
+    assert route.opening("<p>Too little to sum up.</p>") == ""
 
 
 def test_layout_wraps_and_drops_the_leading_space():
