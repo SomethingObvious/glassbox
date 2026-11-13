@@ -702,7 +702,7 @@ async function replay(keepStatus = false) {
       ? [
           `Today's top Hacker News headline${day ? ` (${day})` : ""}, `,
           Object.assign(document.createElement("a"), { href: link, textContent: title }),
-          `, explained by ${who}.`,
+          `, and three questions about it from ${who}.`,
         ]
       : `A recorded run by ${who}.`;
     await play(trace, keepStatus ? null : said);

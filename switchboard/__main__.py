@@ -49,8 +49,14 @@ def main() -> None:
         else:
             title, link = route.headline()
         t = draft.trace(draft.ask(title))
-        # The page shows the day and links the story beside the run.
-        t["headline"] = {"title": title, "link": link, "day": day}
+        new = draft.invented(title, "".join(p for s in t["steps"] for p in [*s["drafted"][: s["kept"]], s["target"]]))
+        if new:
+            # The model hasn't read the story, so the day's run is the saved prompt instead.
+            print(f"Left the headline out, as the answer names {', '.join(new)}")
+            t = draft.trace()
+        else:
+            # The page shows the day and links the story beside the run.
+            t["headline"] = {"title": title, "link": link, "day": day}
         save(args.headline, draft.render(t))
         args.headline.with_suffix(".json").write_text(json.dumps(t), encoding="utf-8")
     elif args.headline:

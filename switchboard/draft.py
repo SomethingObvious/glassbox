@@ -1,6 +1,7 @@
 """Greedy speculative decoding: an EAGLE-3 head guesses tokens and Qwen3-1.7B checks them in one pass."""
 
 import itertools
+import re
 from collections.abc import Sequence
 from typing import NamedTuple, NotRequired, TypedDict
 
@@ -19,6 +20,11 @@ CHAR, LINE_H, MARGIN = 12.0, 46, 60  # px per 20 px mono character, px per line
 SMALL, SMALL_H = 9.0, 26  # the same for the 15 px text of the run alone
 LEAD, HOLD, OUT = 1.0, 4.0, 0.5  # seconds before the banner starts writing, after it finishes, and to fade out
 RACE = 20.0  # most seconds the banner takes to write before it plays faster than real time
+WORD = re.compile(r"[A-Za-z][A-Za-z'-]*|\d[\d,.]*")
+OPENERS = frozenset(
+    ["what", "why", "how", "who", "whom", "whose", "when", "where", "which", "is", "are", "was", "were"]
+    + ["does", "do", "did", "will", "can", "could", "would", "should", "has", "have"]
+)
 
 
 class Step(TypedDict):
@@ -45,7 +51,33 @@ class Trace(TypedDict):
 
 
 def ask(title: str) -> str:
-    return f'In three sentences, explain this Hacker News headline: "{title}"'
+    # Asked to explain a headline, a model this small makes the story up, so it asks about it instead.
+    return (
+        f'You have not read the story behind this Hacker News headline: "{title}"\n'
+        "Write three short questions you would want it to answer, one per line. Name nothing the headline does "
+        "not name."
+    )
+
+
+def invented(title: str, answer: str) -> list[str]:
+    """The names and numbers in `answer` that `title` doesn't have, which the model can only have made up.
+
+    A name is a capitalised word, unless it is a question word that opens a line.
+    """
+    # ponytail: capital letters and digits are all it looks at, so something made up in lower case gets past it.
+
+    def bare(word: str) -> str:
+        return word.lower().removesuffix("'s").rstrip("'")
+
+    known = {bare(w) for w in WORD.findall(title)}
+    found = []
+    for sentence in re.split(r"(?<=[.?!])\s+|\n+", answer):
+        words = WORD.findall(re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", sentence))
+        for at, word in enumerate(words):
+            named = word[0].isdigit() or (word[0].isupper() and (at > 0 or word.lower() not in OPENERS))
+            if named and word != "I" and bare(word) not in known:
+                found.append(word)
+    return found
 
 
 class Placed(NamedTuple):

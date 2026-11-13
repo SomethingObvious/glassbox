@@ -19,6 +19,30 @@ def test_accepted_stops_at_the_first_miss(guesses, wants, kept):
     assert draft.accepted(guesses, wants) == kept
 
 
+@pytest.mark.parametrize(
+    ("title", "answer", "new"),
+    [
+        (
+            "Jensen Huang resigns",
+            "Jensen Huang resigns from his position as CEO of Alibaba.  \nAlibaba's board accepted it.",
+            ["CEO", "Alibaba", "Alibaba's"],
+        ),
+        (
+            "Jensen Huang resigns",
+            "- Why did Jensen Huang resign from his position?  \n- What impact will his resignation have?",
+            [],
+        ),
+        (
+            "A false smoke alarm almost drowned Jane Street's only NYC datacenter",
+            "1. How did the alarm go off in 2024?\n2. Is Jane Street moving out of NYC?\n3. Google asked why.",
+            ["2024", "Google"],
+        ),
+    ],
+)
+def test_invented_finds_only_made_up_names(title, answer, new):
+    assert draft.invented(title, answer) == new
+
+
 def test_layout_wraps_and_drops_the_leading_space():
     placed = draft.layout(["Hello", " world", " again"], 0, 0, 12 * 11)
     assert [(p.y, p.text) for p in placed] == [(0, "Hello"), (0, " world"), (draft.LINE_H, "again")]
