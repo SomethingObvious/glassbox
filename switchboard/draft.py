@@ -22,8 +22,8 @@ LEAD, HOLD, OUT = 1.0, 4.0, 0.5  # seconds before the banner starts writing, aft
 RACE = 20.0  # most seconds the banner takes to write before it plays faster than real time
 WORD = re.compile(r"[A-Za-z][A-Za-z'-]*|\d[\d,.]*")
 OPENERS = frozenset(
-    ["what", "why", "how", "who", "whom", "whose", "when", "where", "which", "is", "are", "was", "were"]
-    + ["does", "do", "did", "will", "can", "could", "would", "should", "has", "have"]
+    {"what", "why", "how", "who", "whom", "whose", "when", "where", "which", "is", "are", "was", "were"}
+    | {"does", "do", "did", "will", "can", "could", "would", "should", "has", "have"}
 )
 
 
