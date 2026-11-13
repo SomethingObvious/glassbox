@@ -41,7 +41,7 @@ class Trace(TypedDict):
     experts: int
     k: int
     runs: list[Run]
-    headline: NotRequired[dict[str, str]]  # the daily run's day and Hacker News link
+    headline: NotRequired[dict[str, str | int]]  # the daily run's day, Hacker News link and place there
 
 
 def trace(sentences: Sequence[str] = SENTENCES) -> Trace:
@@ -71,16 +71,21 @@ def trace(sentences: Sequence[str] = SENTENCES) -> Trace:
     return {"model": MODEL, "experts": model.config.num_local_experts, "k": k, "runs": runs}
 
 
-def headline() -> tuple[str, str]:
-    """Today's top Hacker News story title and its discussion page."""
+def headline() -> tuple[str, str, int]:
+    """The highest of today's top ten Hacker News stories that can be read: its title, discussion page and place.
+
+    Some sites turn a script away, and it is the top story when all ten do.
+    """
 
     def get(url: str) -> dict | list:
         with urllib.request.urlopen(url, timeout=30) as r:
             return json.load(r)
 
-    top = get("https://hacker-news.firebaseio.com/v0/topstories.json")[0]
-    title = get(f"https://hacker-news.firebaseio.com/v0/item/{top}.json")["title"]
-    return title, f"https://news.ycombinator.com/item?id={top}"
+    tops = get("https://hacker-news.firebaseio.com/v0/topstories.json")[:10]
+    links = [f"https://news.ycombinator.com/item?id={top}" for top in tops]
+    place = next((at for at, link in enumerate(links) if story(link)), 0)
+    title = get(f"https://hacker-news.firebaseio.com/v0/item/{tops[place]}.json")["title"]
+    return title, links[place], place + 1
 
 
 class Paragraphs(HTMLParser):

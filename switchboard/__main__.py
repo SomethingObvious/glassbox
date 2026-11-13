@@ -1,7 +1,7 @@
 """Command line: `python -m switchboard {route,draft}` redraws a banner, `--trace` reruns its model first.
 
-`--headline` runs route or draft on today's top Hacker News title. Draft takes the title from the route.json
-that route wrote beside it, so both figures show the same story.
+`--headline` runs route or draft on the highest of today's Hacker News stories that can be read. Draft takes
+the title from the route.json that route wrote beside it, so both figures show the same story.
 
 `python -m switchboard quant` and `lens` run Qwen3-0.6B for Figures 3 and 4, which have no banners. `routes`
 exports the model Figure 2 runs in the browser to build/routes, and `head` exports Figure 1's to build/head.
@@ -24,7 +24,7 @@ def save(path: Path, svg: str) -> None:
     print(f"{path} ({path.stat().st_size / 1024:.0f} KB)")
 
 
-def told_today(title: str, link: str, day: str) -> draft.Trace:
+def told_today(title: str, link: str, day: str, place: int) -> draft.Trace:
     """The day's run of Figure 1: the story summed up from its opening, or else three questions about its headline.
 
     A run whose answer names anything the model wasn't shown has made it up, and the saved prompt runs if both do.
@@ -36,8 +36,8 @@ def told_today(title: str, link: str, day: str) -> draft.Trace:
         t = draft.trace(prompt)
         new = draft.invented(shown, "".join(p for s in t["steps"] for p in [*s["drafted"][: s["kept"]], s["target"]]))
         if not new:
-            # The page shows the day, links the story and says whether the model read it.
-            t["headline"] = {"title": title, "link": link, "day": day, "how": how}
+            # The page shows the day, links the story and says where it stood and whether the model read it.
+            t["headline"] = {"title": title, "link": link, "day": day, "how": how, "place": place}
             if how == "read":
                 # The story's own words stay out of what is published.
                 t["prompt"] = draft.read(title, "[its first paragraphs]")
@@ -68,19 +68,20 @@ def main() -> None:
         if routed.exists():
             told = json.loads(routed.read_text(encoding="utf-8"))
             title, link, day = told["runs"][0]["text"], told["headline"]["link"], told["headline"]["day"]
+            place = told["headline"].get("place", 1)
         else:
-            title, link = route.headline()
-        t = told_today(title, link, day)
+            title, link, place = route.headline()
+        t = told_today(title, link, day, place)
         save(args.headline, draft.render(t))
         args.headline.with_suffix(".json").write_text(json.dumps(t), encoding="utf-8")
     elif args.headline:
+        title, link, place = route.headline()
         subtitle = (
-            f"Today's top Hacker News headline ({day}), routed live through IBM Granite 3.0 1B-A400M. "
-            "Each token goes to 8 of 32 experts in every one of 24 layers."
+            f"Today's {'top' if place == 1 else f'number {place}'} Hacker News headline ({day}), routed live "
+            "through IBM Granite 3.0 1B-A400M. Each token goes to 8 of 32 experts in every one of 24 layers."
         )
-        title, link = route.headline()
         t = route.trace([title])
-        t["headline"] = {"day": day, "link": link}
+        t["headline"] = {"day": day, "link": link, "place": place}
         save(args.headline, route.render(t, subtitle))
         # The page reads this to put the headline first in Figure 2.
         args.headline.with_suffix(".json").write_text(json.dumps(t), encoding="utf-8")

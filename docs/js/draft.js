@@ -697,10 +697,11 @@ async function replay(keepStatus = false) {
   try {
     const trace = await recorded();
     const who = `${trace.target.split("/").pop()}, its ${trace.draft} guessing ${trace.depth} tokens a pass`;
-    const { title, link, day, how } = trace.headline ?? {};
+    const { title, link, day, how, place = 1 } = trace.headline ?? {};
     const said = title
       ? [
-          `Today's top Hacker News headline${day ? ` (${day})` : ""}, `,
+          // The top story's site can turn the workflow away, and the run is then of the next it could read.
+          `Today's ${place > 1 ? `number ${place}` : "top"} Hacker News headline${day ? ` (${day})` : ""}, `,
           Object.assign(document.createElement("a"), { href: link, textContent: title }),
           // A day the story couldn't be read, the model only asks about its headline.
           how === "read"

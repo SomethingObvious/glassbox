@@ -151,14 +151,14 @@ function show(j) {
       : `It shares ${(shared / run.layers.length).toFixed(1)} of its ${state.trace.k} experts per layer with the token before it.`;
 }
 
-/** Today's top Hacker News headline, which a daily workflow routes and pushes to the live branch. */
+/** The Hacker News headline that a daily workflow routed and pushed to the live branch. */
 async function headline() {
   try {
     const live = await json(LIVE);
-    const { day, link } = live.headline;
+    const { day, link, place = 1 } = live.headline;
     const note = $("r-live");
     note.replaceChildren(
-      `The first sentence is today's top `,
+      `The first sentence is today's ${place > 1 ? `number ${place}` : "top"} `,
       Object.assign(document.createElement("a"), { href: link, textContent: "Hacker News headline" }),
       `, routed on ${day} by a daily workflow that runs the same model.`,
     );

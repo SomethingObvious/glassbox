@@ -52,7 +52,7 @@ class Trace(TypedDict):
     depth: int
     steps: list[Step]
     timing: Timing
-    headline: NotRequired[dict[str, str]]
+    headline: NotRequired[dict[str, str | int]]
 
 
 def read(title: str, opening: str) -> str:
