@@ -203,7 +203,7 @@ function stage({ steps, timing }) {
   const pace = speed === 1 ? "real speed" : `${speed.toFixed(1)} times real speed`;
   $("race-note").textContent =
     `${timing.same ? "The same text" : "Nearly the same text"} written both ways. ` +
-    `Every pass was timed on ${timing.device}, and the race plays at ${pace}.`;
+    `Both clocks start once the prompt is read. Every pass was timed on ${timing.device}, and the race plays at ${pace}.`;
   return speed;
 }
 
@@ -696,7 +696,7 @@ const recorded = () => {
 async function replay(keepStatus = false) {
   try {
     const trace = await recorded();
-    const who = `${trace.target.split("/").pop()}, its ${trace.draft} guessing ${trace.depth} tokens a pass`;
+    const who = `${trace.target.split("/").pop()}, its ${trace.draft} guessing up to ${trace.depth} tokens a pass`;
     const { title, link, day, how, place = 1 } = trace.headline ?? {};
     const said = title
       ? [
@@ -736,8 +736,8 @@ async function play(trace, said) {
       if (over()) return;
       const wait = (1000 * at) / speed - (performance.now() - started);
       if (!calm && wait > 0) await sleep(wait);
-      // playStep spends about 2.2 paces on a pass with 4 guesses.
-      const pace = calm ? 0 : (1000 * step.seconds) / speed / 2.2;
+      // playStep spends 1.6 paces on a pass and 0.15 more on each guess.
+      const pace = calm ? 0 : (1000 * step.seconds) / speed / (1.6 + 0.15 * step.drafted.length);
       await playStep(step, text, tokensIn(trace.steps.slice(0, i)), pace);
       if (over()) return;
       at += step.seconds;

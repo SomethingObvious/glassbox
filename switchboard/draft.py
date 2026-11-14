@@ -15,7 +15,8 @@ HEAD = {
     "revision": "efcba5ef85bd4bb69b9fe0577dbd859e6e748e38",
 }
 PROMPT = "In three sentences, explain why the sky is blue."
-DEPTH, MOST, RUNS = 4, 160, 3
+DEPTH, MOST, RUNS = 8, 160, 3
+SURE = 0.4  # the head stops guessing once its odds that every guess so far is right fall below this
 CHAR, LINE_H, MARGIN = 12.0, 46, 60  # px per 20 px mono character, px per line
 SMALL, SMALL_H = 9.0, 26  # the same for the 15 px text of the run alone
 LEAD, HOLD, OUT = 1.0, 4.0, 0.5  # seconds before the banner starts writing, after it finishes, and to fade out
@@ -135,15 +136,16 @@ def trace(prompt: str = PROMPT) -> Trace:
     stop = {tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>")}
 
     def median(runs: list[list[float]]) -> list[float]:
-        return sorted(runs, key=sum)[len(runs) // 2]
+        """The run with the median total, with both clocks started once the prompt is read, as on the page."""
+        return [0.0, *sorted((r[1:] for r in runs), key=sum)[len(runs) // 2]]
 
     with torch.inference_mode():
-        passes = eagle.guessed(big, head, ids, DEPTH, MOST, stop)  # the first run of each warms up
+        passes = eagle.guessed(big, head, ids, DEPTH, MOST, stop, SURE)  # the first run of each warms up
         n = sum(kept + 1 for _, kept, _, _ in passes)
         eagle.alone(big, ids, n)
         spec, solo = [], []
         for _ in range(RUNS):
-            spec.append([s for *_, s in eagle.guessed(big, head, ids, DEPTH, MOST, stop)])
+            spec.append([s for *_, s in eagle.guessed(big, head, ids, DEPTH, MOST, stop, SURE)])
             written, times = eagle.alone(big, ids, n)
             solo.append(times)
     ours = [t for guesses, kept, own, _ in passes for t in [*guesses[:kept], own]]
@@ -224,8 +226,8 @@ def render(t: Trace) -> str:
         text(
             60,
             106,
-            f"An EAGLE-3 head reads Qwen3-1.7B's hidden states and guesses the next {depth} tokens. Qwen3-1.7B "
-            f"checks all {depth} in one pass and keeps them up to the first miss.",
+            f"An EAGLE-3 head reads Qwen3-1.7B's hidden states and guesses up to {depth} tokens, as many as it's "
+            "sure of. Qwen3-1.7B checks them in one pass and keeps them up to the first miss.",
             19,
             SOFT,
         ),
@@ -313,19 +315,20 @@ def render(t: Trace) -> str:
     by = ry + 130
     bw = (W - 120) / len(steps)
     body.append(text(60, by, "tokens gained per pass of the big model", 15, SOFT))
+    tall = max(s["kept"] for s in steps)
     for si, s in enumerate(steps):
         x = 60 + si * bw
-        body.append(rect(x, by + 14, bw - 8, (depth + 1) * 18, FAINT))
+        body.append(rect(x, by + 14, bw - 8, (tall + 1) * 18, FAINT))
         cells = [
-            rect(x, by + 14 + (depth - j) * 18, bw - 8, 16, INK)
+            rect(x, by + 14 + (tall - j) * 18, bw - 8, 16, INK)
             if j < s["kept"]
-            else rect(x + 1, by + 15 + (depth - j) * 18, bw - 10, 14, SHEET, stroke=INK, width=2)
+            else rect(x + 1, by + 15 + (tall - j) * 18, bw - 10, 14, SHEET, stroke=INK, width=2)
             for j in range(s["kept"] + 1)
         ]
         hidden.append(tl.show(f"b{si}", settled[si], end, out=OUT))
         body.append(f'<g class="{hidden[-1]}">{"".join(cells)}</g>')
 
-    fy = by + 14 + (depth + 1) * 18 + 40
+    fy = by + 14 + (tall + 1) * 18 + 40
     kx = 60.0
     for draw, numeral, label in [
         (lambda x: rect(x, fy - 15, 22, 16, stroke=INK, dash="4 3"), 102, "guessed by the head"),
@@ -342,7 +345,8 @@ def render(t: Trace) -> str:
             60,
             fy + 40,
             f"{'The same' if timing['same'] else 'Nearly the same'} text, {len(written)} tokens from {len(steps)} "
-            f"big-model passes and {alone[-1] / spec[-1]:.2f} times as fast with guesses. Every pass was timed on "
+            f"big-model passes and {alone[-1] / spec[-1]:.2f} times as fast with guesses once the prompt is read. "
+            "Every pass was timed on "
             f"{timing['device']}, and it plays at {pace}.",
             17,
             SOFT,

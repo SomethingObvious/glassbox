@@ -142,11 +142,18 @@ def alone(model: torch.nn.Module, prompt: list[int], n: int) -> tuple[list[int],
 
 
 def guessed(
-    model: torch.nn.Module, head: Head, prompt: list[int], depth: int, most: int, stop: Collection[int]
+    model: torch.nn.Module,
+    head: Head,
+    prompt: list[int],
+    depth: int,
+    most: int,
+    stop: Collection[int],
+    sure: float = 0.0,
 ) -> list[tuple[list[int], int, int, float]]:
     """Each pass as (guesses, how many were kept, the big model's own token, seconds), until a stop token or `most`.
 
-    The first pass reads the prompt and has no guesses, as the head needs the big model's states to start.
+    The head guesses up to `depth` tokens a pass, and stops early once its own odds that every guess so far is right
+    fall below `sure`. The first pass reads the prompt and has no guesses, as the head needs the big model's states.
     """
     head.keep(0)
     big, dev = Big(model), model.device
@@ -159,13 +166,14 @@ def guessed(
         # Catch the head up on the big model's real states, then let it run on its own output.
         h, logits = head.step(states, seq[head.done + 1 : base])
         real = head.done
-        guesses = [head.guess(logits[-1])]
-        for _ in range(depth - 1):
+        guesses, odds = [head.guess(logits[-1])], logits[-1].float().softmax(-1).max().item()
+        while len(guesses) < depth and odds >= sure:
             h, logits = head.step(h[-1:], guesses[-1:])
             guesses.append(head.guess(logits[-1]))
+            odds *= logits[-1].float().softmax(-1).max().item()
         head.keep(real)
         logits, states = big.feed(seq + guesses, states=True)
-        wants = logits[-(depth + 1) :].argmax(-1).tolist()
+        wants = logits[-(len(guesses) + 1) :].argmax(-1).tolist()
         kept = accepted(guesses, wants)
         # A kept guess can end the answer, and nothing guessed after it counts.
         if (end := next((j for j, g in enumerate(guesses[:kept]) if g in stop), None)) is not None:
