@@ -42,6 +42,11 @@ def test_accepted_stops_at_the_first_miss(guesses, wants, kept):
             "The story is about Jensen Huang leaving Nvidia's top job. He led it from 1993. It ran for 33 years.",
             [],
         ),
+        (
+            "Ggml v1.0.0, a tensor library",
+            "Tensor library for machine learning has released version 1.0.0. Additionally, Vulkan got faster.",
+            ["Vulkan"],
+        ),
     ],
 )
 def test_invented_finds_only_made_up_names(title, answer, new):

@@ -76,7 +76,8 @@ def ask(title: str) -> str:
 def invented(shown: str, answer: str) -> list[str]:
     """The names and numbers in `answer` that `shown` doesn't have, which the model can only have made up.
 
-    A name is a capitalised word, unless it opens a sentence and is one of the common words that do.
+    A name is a capitalised word, unless it opens a sentence and is one of the common words that do, or is followed
+    by a comma there, as linking words like "Additionally," are.
     """
     # ponytail: capital letters and digits are all it looks at, so something made up in lower case gets past it.
 
@@ -85,10 +86,12 @@ def invented(shown: str, answer: str) -> list[str]:
 
     known = {bare(w) for w in WORD.findall(shown.replace("’", "'"))}
     found = []
-    for sentence in re.split(r"(?<=[.?!])\s+|\n+", answer.replace("’", "'")):
-        words = WORD.findall(re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", sentence))
-        for at, word in enumerate(words):
-            named = word[0].isdigit() or (word[0].isupper() and (at > 0 or word.lower() not in OPENERS))
+    for said in re.split(r"(?<=[.?!])\s+|\n+", answer.replace("’", "'")):
+        sentence = re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", said)
+        linking = re.match(r"[^\W\d_]+,", sentence)
+        for at, word in enumerate(WORD.findall(sentence)):
+            opener = at == 0 and (linking or word.lower() in OPENERS)
+            named = word[0].isdigit() or (word[0].isupper() and not opener)
             if named and word != "I" and bare(word) not in known:
                 found.append(word)
     return found
